@@ -403,6 +403,76 @@ Alternating runs (game-like mode, 1500 frames), round-3 settings vs 30 + 31:
 (Absolute numbers include the background GPU load; the quiet-machine Balanced figure for round 3 was 1.33 ms, so
 expect about 1.25 ms there.)
 
+## Round 5: toward 1 ms
+
+Measured in the test app only (TLOU2's Balanced size, game-like inputs, Metal 4), alternating each change with its
+baseline: the Mac's GPU clocks and other apps' GPU use moved absolute times by up to 2× during this round. Start:
+mid **1.326 ms** (sum of the per-pass times).
+
+Where the time is at the start: post 0.365, pre 0.223, the 14 convs 0.70 (near the GPU's peak math rate), prep 0.04.
+Two probes framed the round:
+
+- **Barriers:** with every barrier dropped (`NSS_NOBARRIERS=1`, wrong output, measurement only) a frame takes
+  1.24–1.25 ms instead of 1.33–1.35. Overlapping work can win back at most ~0.09 ms.
+- **Post-process:** switching parts off, the filter taps cost ~0.12 ms and the history sample ~0.045; the rest
+  (~0.15) is mostly the two full-size writes. Post is limited by memory traffic and arithmetic both (see 37).
+
+### 32. Conv results stored straight from matrix registers — kept
+
+Each conv wrote its 8×8 result tiles to threadgroup memory, waited, and had every thread read them back to add the
+bias, apply the activation and store. Full tiles now do that on the matrix elements in registers
+(`thread_elements()`): the bias rows come in as a matrix loaded with stride 0, then one half-precision store per 8
+channels. Same operations in the same order (sum, + bias, activation, to half); edge tiles keep the old path.
+`NSS_NODIRECT=1` restores it everywhere.
+
+- convs 0.701 → 0.680 ms; total **1.326 → 1.306 ms (−0.02)**. Bit-exact.
+
+### 33. History in RG11B10 — rejected
+
+The history (2560×1600, read by post and pre, written by post) in 4 bytes per pixel instead of 8: total −0.05 ms,
+almost all in pre (0.223 → 0.175). But the rounding is fed back every frame and piles up: 35.9 dB against the exact
+output, mean 3/255, up to 48/255. Rejected; kept as `NSS_HISTORY=rg11b10` for reference.
+
+### 34. A light copy of the history for the pre-process — kept
+
+Pre only reads the history as one of the network's inputs; it never writes it back. So post now also writes an
+RG11B10 copy of each new history frame, and pre (mid/low) reads that; post keeps its full-precision history, so
+nothing accumulates. `NSS_PRE_HISTORY=full` reads the full history again.
+
+- pre 0.224 → 0.177 ms, post unchanged within noise; total **1.312 → 1.270 ms (−0.043)**.
+- 61.5 dB against the exact output, mean 0.03/255, at most 6/255.
+
+### 35. Pre-process: one nearest-depth search per input pixel — kept
+
+Pre searched the 4×4 depth window of each of its four input pixels twice (for the history samples, and again for the
+motion it hands to post). The second loop reuses the first's results.
+
+- pre 0.177 → 0.170 ms; total **−0.005**. Bit-exact.
+
+### 36. Post: the four offset-table entries in one load — no change
+
+One 16-byte load instead of four 4-byte ones per output pixel: post 0.368 → 0.368–0.371. The table reads aren't what
+post waits on. Reverted.
+
+### 37. History as 10 bits per channel, perceptually encoded — rejected
+
+RGB10A2 holding the square root of the tonemapped colour: finer steps than RG11B10 in the dark, half the bytes of
+RGBA16F, and pre could read it directly. Slower (post 0.367 → 0.393: decoding every history read costs more than the
+bytes saved) and it still drifts (45.2 dB, up to 75/255). Removed.
+
+### Round 5 total
+
+| | NSS mid | NSS low |
+|---|---|---|
+| start | 1.326 ms | – |
+| after 32, 34, 35 | **1.26 ms** (whole frame 1.25) | 1.22 ms |
+
+Mid −0.065 ms (−5%), 61.5 dB from the exact output (all of it from 34). 1 ms isn't reachable this way: the convs run
+near the GPU's peak math rate, barrier overlap is worth ≤0.09 ms, and post's memory traffic only shrinks with a
+lower-precision history, which drifts. What's left without changing the output is ~0.01–0.03 ms per idea (the last
+layer's padded output channels, conv9 overlapping more of the chain); below ~1.15 ms would take a smaller network or
+a cheaper post-process, both of which change the image.
+
 ## Running total
 
 Upscale GPU time at 1488×928 → 2560×1600 (Metal 4, harness), after each kept experiment:

@@ -73,6 +73,7 @@ static int nss_gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } re
     id<MTLComputePipelineState> layerPSO[14];   // that variant compiled with the layer's shape as function constants
     id<MTLLibrary> lib;
     id<MTLTexture> history[2], dummy;
+    id<MTLTexture> historyLite[2];   // RG11B10 copy of the history for the pre-process (written by post alongside it)
     // Metal 4: argument table, constant uploads, and residency for our resources (and the game's, as seen)
     id<MTL4ArgumentTable> table;
     id<MTLBuffer> upload[3];
@@ -136,6 +137,9 @@ static NSMapTable<id, NSString *> *psoNames;
     if (m4) [m4 setThreadgroupMemoryLength:n atIndex:i]; else [m3 setThreadgroupMemoryLength:n atIndex:i];
 }
 - (void)order {
+    static int noBarriers = -1;   // NSS_NOBARRIERS=1: measurement only (wrong output): what the barriers cost at most
+    if (noBarriers < 0) noBarriers = nssEnv("NOBARRIERS") != NULL;
+    if (noBarriers) overlapNext = YES;
     if (overlapNext) { overlapNext = NO; dispatched = YES; return; }
     if (m4 && dispatched)
         [m4 barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch
@@ -309,7 +313,12 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibr
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:wo height:ho mipmapped:NO];
     td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
+    // NSS_HISTORY=rg11b10: history in 4 bytes per pixel instead of 8 (experiment 33: drifts, rejected)
+    if (nssEnv("HISTORY") && !strcmp(nssEnv("HISTORY"), "rg11b10")) td.pixelFormat = MTLPixelFormatRG11B10Float;
     e->history[0] = [dev newTextureWithDescriptor:td], e->history[1] = [dev newTextureWithDescriptor:td];
+    td.pixelFormat = MTLPixelFormatRG11B10Float;
+    e->historyLite[0] = [dev newTextureWithDescriptor:td], e->historyLite[1] = [dev newTextureWithDescriptor:td];
+    td.pixelFormat = MTLPixelFormatRGBA16Float;
     td.width = td.height = 1;
     e->dummy = [dev newTextureWithDescriptor:td];
 
@@ -341,7 +350,7 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibr
         NSMutableArray *all = [NSMutableArray arrayWithArray:e->tensors];
         [all addObjectsFromArray:@[e->weights, e->biases, e->depth, e->motion, e->depthTm1, e->dis, e->disLqB, e->nearest, e->kBuf, e->dilMotion,
                                    (id)e->depthTm1Alt ?: (id)e->dummy, (id)e->blockStats ?: (id)e->dummy,
-                                   e->deriv[0], e->deriv[1], e->history[0], e->history[1], e->dummy, e->tempView[0], e->tempView[1], e->derivTex[0], e->derivTex[1]]];
+                                   e->deriv[0], e->deriv[1], e->history[0], e->history[1], e->historyLite[0], e->historyLite[1], e->dummy, e->tempView[0], e->tempView[1], e->derivTex[0], e->derivTex[1]]];
         [all addObject:e->lut], [all addObject:e->lutMap], [all addObject:e->lutCache];
         for (int i = 0; i < 3; i++) [all addObject:e->upload[i]];
         for (id<MTLAllocation> a in all) [e->residency addAllocation:a];
@@ -545,6 +554,7 @@ static void nssTune(NssEngine *e, id<MTLCommandQueue> q) {
             for (int j = 0; j < 9; j++) [fc setConstantValue:&shapeVals[j] type:MTLDataTypeInt atIndex:10 + j];
             if (pack) { const bool yes = true; [fc setConstantValue:&yes type:MTLDataTypeBool atIndex:19]; }
             if (split > 1) [fc setConstantValue:&split type:MTLDataTypeInt atIndex:20];
+            if (nssEnv("NODIRECT")) { const bool yes = true; [fc setConstantValue:&yes type:MTLDataTypeBool atIndex:21]; }
             NSError *err = nil;
             NSString *name = [NSString stringWithFormat:@"nss_%@conv_mma_%d_p%d", k.upc ? @"up" : @"", l.ocp, px];
             id<MTLFunction> f = [e->lib newFunctionWithName:name constantValues:fc error:&err];
@@ -788,7 +798,9 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
     }
 
     // pre-process
-    [c setTexture:fr->color atIndex:0], [c setTexture:e->history[p] atIndex:1], [c setTexture:e->tempView[p] atIndex:2];
+    // mid/low read the light copy (NSS_PRE_HISTORY=full: the full history); high reads the full history
+    const BOOL lite = e->half_ && !(nssEnv("PRE_HISTORY") && !strcmp(nssEnv("PRE_HISTORY"), "full"));
+    [c setTexture:fr->color atIndex:0], [c setTexture:lite ? e->historyLite[p] : e->history[p] atIndex:1], [c setTexture:e->tempView[p] atIndex:2];
     [c setTexture:e->derivTex[p] atIndex:3], [c setTexture:e->derivTex[1 - p] atIndex:4];
     [c setBuffer:e->kBuf offset:0 atIndex:12];
     const float ctInv[2] = {1.0f / fr->color.height, 1.0f / fr->color.width};   // (row, col)
@@ -841,6 +853,7 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
     [c setBuffer:e->dilMotion offset:0 atIndex:8];
     [c setTexture:e->history[1 - p] atIndex:0], [c setTexture:fr->color atIndex:1], [c setTexture:e->history[p] atIndex:2];
     [c setTexture:fr->output atIndex:3], [c setBuffer:e->kBuf offset:0 atIndex:9];
+    [c setTexture:e->historyLite[1 - p] atIndex:4 + 1];
     gridTG(e->post, Wo, Ho, "NSS_TG_POST");   // also writes the game's output
     if (c->m4) {
         if (c->profHeap) e->profPending = c->profNames;

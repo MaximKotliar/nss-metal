@@ -124,6 +124,7 @@ static inline float3 karisInverse(float3 x)
     x = clamp(max(x, 0.0f), 0.0f, lim);
     return x / (1.0f - max(max(x.r, x.g), x.b));
 }
+
 constexpr sampler kLinClamp(filter::linear, address::clamp_to_edge);
 constexpr sampler kLinZero(filter::linear, address::clamp_to_zero);
 // textures are addressed (x, y) = (col, row)
@@ -771,12 +772,14 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
     const int2 hb = clamp(proc * 2, int2(0), inD - 1);
     const int2 lanes[4] = {hb, min(hb + int2(1, 0), inD - 1), min(hb + int2(0, 1), inD - 1), min(hb + int2(1, 1), inD - 1)};
     float3 warped = 0;
+    int2 laneOff[4];   // nearest-depth offsets of the four lanes, reused for post's motion below
     for (int l = 0; l < ((fcPreAblate & 2) ? 1 : 4); ++l)
     {
         const int2 ic = clamp(lanes[l], int2(0), inD - 1);
         float d;
         int2 o;
         nearestLowMid(depth, inD, ic, d, o);
+        laneOff[l] = o;
         const float2 m = motionAt(motion, inD, clamp(ic + o, int2(0), inD - 1));
         const float2 r = (float2(ic) + 0.5f) * invIn - m * invIn;
         warped += karis(history.sample(kLinZero, r.yx).rgb * kx);
@@ -808,7 +811,10 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
     {
         float d;
         int2 o;
-        if (fcPreAblate & 4) o = int2(0); else nearestLowMid(depth, inD, q[l], d, o);
+        // q[l] is lanes[] in another order: (0,0) (0,1) (1,0) (1,1) vs (0,0) (1,0) (0,1) (1,1)
+        if (fcPreAblate & 4) o = int2(0);
+        else if (fcPreAblate & 2) nearestLowMid(depth, inD, q[l], d, o);
+        else o = laneOff[l == 1 ? 2 : l == 2 ? 1 : l];
         // post reads the motion at the nearest-depth neighbour straight from here (one load instead of two)
         const int2 icq = padded * 2 + int2(l >> 1, l & 1);
         const int2 dc = clamp(icq + o, int2(0), inD - 1);
@@ -966,7 +972,8 @@ constant bool fcPOn = is_function_constant_defined(fcP_inDims);
 static inline void postPixel(constant PostArgs& A, texture2d<float> color, texture2d<float> history,
                              const device half* kpn, texture2d<float> temporal, const device float2* motion,
                              const device float* nearest, const device float2* dilMotion, const device uint* lut, texture2d<float, access::write> outTex,
-                             texture2d<float, access::write> gameOut, const device float* gameK, uint2 gid)
+                             texture2d<float, access::write> gameOut, const device float* gameK,
+                             texture2d<float, access::write> liteOut, uint2 gid)
 {
     const float kx = gameK[0] * P_exposure;   // the game's exposure / preExposure: NSS's exposure input
     const int2 px = int2(gid.y, gid.x);
@@ -1054,6 +1061,8 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
     const float3 outL = karisInverse(clamp(acc, 0.f, 1.f - EPS)) * (1.0f / kx);
     if (!(P_ablate & 16)) outTex.write(float4(outL, 1.0f), uint2(gid));
     if (P_writeGame && !(P_ablate & 8)) gameOut.write(float4(outL, 1.0f), uint2(gid));
+    // a 4-byte copy of the history for the next frame's pre-process (which only reads it as a network input)
+    if (!(P_ablate & 32)) liteOut.write(float4(outL, 1.0f), uint2(gid));
 }
 
 #define POST_ARGS constant PostArgs& A [[buffer(0)]], \
@@ -1061,11 +1070,12 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
     const device half* kpn [[buffer(3)]], texture2d<float> temporal [[texture(4)]], \
     const device float2* motion [[buffer(5)]], const device float* nearest [[buffer(6)]], const device float2* dilMotion [[buffer(8)]], \
     const device uint* lut [[buffer(7)]], texture2d<float, access::write> outTex [[texture(0)]], \
-    texture2d<float, access::write> gameOut [[texture(3)]], const device float* gameK [[buffer(9)]]
+    texture2d<float, access::write> gameOut [[texture(3)]], const device float* gameK [[buffer(9)]], \
+    texture2d<float, access::write> liteOut [[texture(5)]]
 
 kernel void nss_post(POST_ARGS, uint2 gid [[thread_position_in_grid]])
 {
-    postPixel(A, color, history, kpn, temporal, motion, nearest, dilMotion, lut, outTex, gameOut, gameK, gid);
+    postPixel(A, color, history, kpn, temporal, motion, nearest, dilMotion, lut, outTex, gameOut, gameK, liteOut, gid);
 }
 
 
@@ -1096,6 +1106,9 @@ constant int fcOutWpad [[function_constant(18)]];
 // (3*C rounded up to 8) per kernel row instead of 3 runs of C rounded up (conv0: 5 blocks per row instead of 6)
 constant bool fcPackKx [[function_constant(19)]];
 constant bool kPackKx = is_function_constant_defined(fcPackKx) && fcPackKx;
+// NSS_NODIRECT=1 (function constant 21): conv results through threadgroup memory, as before (for comparisons)
+constant bool fcNoDirect [[function_constant(21)]];
+constant bool kNoDirect = is_function_constant_defined(fcNoDirect) && fcNoDirect;
 // output-channel split: each simdgroup computes OC/split channels and threadgroup z picks the group, so small
 // low-res layers get `split` times the simdgroups (more in flight to hide latency)
 constant int fcOCSplit [[function_constant(20)]];
@@ -1120,10 +1133,32 @@ typedef simdgroup_float8x8 nss_acc8x8;
 typedef float nss_acc_t;
 #endif
 
+// A full tile (8 pixels, every channel real): bias and activation on the matrix elements in registers, then one
+// store per 8 channels straight to the tensor. Same arithmetic in the same order as the path through threadgroup
+// memory below (sum, + bias, activation, to half), without its round trip and barriers.
+template <int NOB>
+static inline void epilogueDirect(thread nss_acc8x8* acc, const device float* bias, device half* dst, ulong rowStride, int act)
+{
+    for (int ob = 0; ob < NOB; ++ob)
+    {
+        simdgroup_float8x8 b;
+        simdgroup_load(b, bias + ob * 8, 0);   // stride 0: every row holds the same 8 biases
+        thread auto& e = acc[ob].thread_elements();
+        thread auto& be = b.thread_elements();
+        float2 v = float2(float(e[0]), float(e[1])) + float2(be[0], be[1]);
+        v = act == 0 ? max(v, 0.0f) : 1.0f / (1.0f + exp(-v));
+        simdgroup_half8x8 h;
+        thread auto& he = h.thread_elements();
+        he[0] = half(v.x), he[1] = half(v.y);
+        simdgroup_store(h, dst + ob * 8, rowStride);
+    }
+}
+
 template <int kOC>
 static void epilogue(thread nss_acc8x8* acc, threadgroup nss_acc_t* t, const device float* bias, device half* dst,
                      int outC, int outStep, int valid, int act, ushort lane)
 {
+    if (valid == 8 && kOC <= outC && !kNoDirect) { epilogueDirect<kOC / 8>(acc, bias, dst, (ulong)outStep * outC, act); return; }
     constexpr int NOB = kOC / 8;
     for (int ob = 0; ob < NOB; ++ob) simdgroup_store(acc[ob], t + ob * 8, kOC);
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1142,6 +1177,7 @@ template <int NOBG>
 static void epilogueG(thread nss_acc8x8* acc, threadgroup nss_acc_t* t, const device float* bias, device half* dst,
                       int ocBase, int outC, int valid, int act, ushort lane)
 {
+    if (valid == 8 && ocBase + NOBG * 8 <= outC && !kNoDirect) { epilogueDirect<NOBG>(acc, bias + ocBase, dst + ocBase, (ulong)outC, act); return; }
     constexpr int W = NOBG * 8;
     for (int ob = 0; ob < NOBG; ++ob) simdgroup_store(acc[ob], t + ob * 8, W);
     simdgroup_barrier(mem_flags::mem_threadgroup);
