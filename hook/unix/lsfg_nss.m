@@ -138,7 +138,7 @@ static NSMapTable<id, NSString *> *psoNames;
 
 static NSString *nssDir(void) {
     if (getenv("LSFG_NSS_DIR")) return @(getenv("LSFG_NSS_DIR"));   // tests: freshly built kernels
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/lsfg-metal/nss"];
+    return [appDataDir() stringByAppendingPathComponent:@"nss"];
 }
 
 static NssT nssTensor(NssEngine *e, int H, int W, int C) {
