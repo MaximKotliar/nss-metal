@@ -532,16 +532,40 @@ process pixel. Post, the depth passes and the network are size-generic.
   depth window once instead of 16 searches gave the same output and no speedup); post unchanged at ~0.39 ms, now
   half the frame.
 - Photo +0.5 dB over mid, wheel equal, fast wheel −0.4 dB. The fence's structure score drops to MetalFX's level.
+  (Measured with the jitter-sign error; see the correction below for the re-measured numbers.)
   In the crops, quarter is hard to tell from mid; the fence differs in fine texture, not in visible artifacts.
 - Mid's default path is bit-exact with this switch compiled in (pre's factor is a function constant).
 - Not checked: in game, and its look at 1.5× (DLSS Quality), where the network is relatively more expensive.
 
+### Correction: jitter sign in the quality harness
+
+The scores above were measured with the jitter passed to MetalFX and NSS with the wrong sign for this scene (it
+jitters its samples by +j; MetalFX's convention, which NSS follows, wants −j). Every temporal upscaler was hurt by it,
+so the comparisons in 38–40 are suspect. The game path is not affected (the hook passes the game's own MetalFX
+values). Re-measured with the right sign, whole-frame PSNR (and frame-to-frame change on the static scene, in
+1/255; the truth's is 0):
+
+| | GPU (harness) | normal motion | 4× motion | static | static flicker |
+|---|---|---|---|---|---|
+| MetalFX | 0.50 ms | 24.2 dB | 23.0 dB | 28.0 dB | 0.44 |
+| NSS mid | 1.36 ms | **25.1 dB** | 22.8 dB | **31.4 dB** | 0.34 |
+| NSS fast (40) | 0.92 ms | 25.0 dB | 22.7 dB | 28.3 dB | 0.80 |
+| NSS low | 1.34 ms | 24.6 dB | 22.9 dB | 31.4 dB | 0.34 |
+
+- In motion, fast matches mid (wheel −0.6 dB at normal speed, fence +0.1).
+- On a still image it loses mid's fine detail: the fence 24.0 → 20.5 dB, MetalFX's level, and it changes 0.8/255 per
+  frame where mid settles at 0.34 (faint shimmer on fine static patterns).
+- On fast motion MetalFX is the best of the three on the moving wheel (23.3 dB vs mid's 19.2); NSS keeps its lead
+  on the fence and the photo.
+- 38 and 39 weren't re-measured; their verdicts rested on time saved vs visible artifacts (39's rim smear) as much as
+  on dB.
+
 ### Round 6 summary
 
-The one lossy option worth offering is the quarter-resolution network: ~0.8 ms (MetalFX ~0.47 in this harness,
-~1.17 in TLOU2), keeping NSS's lead on detail but softer on fine static patterns. Skipping network frames costs
-visible artifacts on moving edges for less gain. The next floor is post-process (~0.39 ms), whose cheap cuts all cost
-detail (38).
+The one lossy option worth offering is the quarter-resolution network (`NSSQualityFast`): ~0.8 ms in the game-like
+harness vs mid's 1.29 (MetalFX ~0.47 here, ~1.17 in TLOU2), as good as mid in motion, at MetalFX's level on fine
+static detail with a little more shimmer there. Skipping network frames costs visible artifacts on moving edges for
+less gain. The next floor is post-process (~0.39 ms), whose cheap cuts all cost detail (38).
 
 ## Running total
 

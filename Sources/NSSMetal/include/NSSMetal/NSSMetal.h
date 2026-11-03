@@ -28,8 +28,8 @@ typedef NS_ENUM(NSInteger, NSSQuality) {
     NSSQualityMid = 1,
     /// Full-resolution network, 9-tap filter. About 3x the cost of mid.
     NSSQualityHigh = 2,
-    /// Quarter-resolution network (mid's weights), Catmull-Rom history. Cheapest: about 0.6x mid's GPU time; detail
-    /// close to mid, fine static patterns a little softer.
+    /// Quarter-resolution network (mid's weights), Catmull-Rom history. Cheapest: about 0.6x mid's GPU time; as good as mid
+    /// in motion, fine static detail at MetalFX's level.
     NSSQualityFast = 3,
 };
 

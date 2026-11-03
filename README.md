@@ -9,7 +9,7 @@ MetalFX's temporal upscaler it keeps more fine detail and flickers less, at abou
 
 | Quality | What changes | GPU time, 1488×928 → 2560×1600, M4 Max |
 |---|---|---|
-| fast | quarter-resolution network (mid's weights), Catmull-Rom history; fine static patterns a little softer | ~0.8 ms |
+| fast | quarter-resolution network (mid's weights), Catmull-Rom history; as good as mid in motion, fine static detail at MetalFX's level | ~0.8 ms |
 | low | half-resolution network, bilinear history | ~1.25 ms |
 | mid | half-resolution network, Catmull-Rom history | ~1.3 ms |
 | high | full-resolution network, 9-tap filter | ~3.5 ms |
