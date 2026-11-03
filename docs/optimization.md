@@ -5,6 +5,11 @@ TLOU2. These notes were written while NSSMetal still lived inside a game hook: p
 from there (`Sources/nss-bench` is this repo's equivalent), and the debug switches were called `LSFG_NSS_*`; they
 are `NSS_*` now (the old names still work).
 
+Arm's NSS: [model card](https://huggingface.co/Arm/neural-super-sampling),
+[paper](https://huggingface.co/Arm/neural-super-sampling/blob/main/2025-neural-super-sampling.pdf),
+[reference implementation](https://github.com/arm/neural-graphics-model-gym),
+[NSS guide](https://developer.arm.com/documentation/111009/latest/).
+
 Goal: cut NSS mid's per-frame cost, which in TLOU2 (GPTK 4, DLSS Balanced, 1488×928 → 2560×1600) was 2.23 ms of GPU
 time per upscale against MetalFX's 1.34 ms.
 

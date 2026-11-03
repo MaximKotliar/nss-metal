@@ -5,6 +5,13 @@ Arm's PyTorch reference, and what it did in a real game (The Last of Us Part II 
 where the game's DLSS calls become MetalFX and NSS was swapped in). Notes from November 2026; the later speedups are
 in [optimization.md](optimization.md).
 
+Arm's NSS:
+
+- Model card and weights: [huggingface.co/Arm/neural-super-sampling](https://huggingface.co/Arm/neural-super-sampling)
+- Paper: [Neural Super Sampling (2025)](https://huggingface.co/Arm/neural-super-sampling/blob/main/2025-neural-super-sampling.pdf)
+- Reference implementation and training (Apache-2.0): [arm/neural-graphics-model-gym](https://github.com/arm/neural-graphics-model-gym), `usecases/nss`
+- [NSS guide](https://developer.arm.com/documentation/111009/latest/) and Arm's [Neural Graphics Development Kit](https://developer.arm.com/mobile-graphics-and-gaming/neural-technology)
+
 Arm publishes NSS v1, a temporal upscaler: a small U-Net (14 conv layers, ~160K parameters) that predicts per-pixel
 filter weights and blend parameters, wrapped in shader pre/post-processing. Weights are on Hugging Face
 (`Arm/neural-super-sampling`); the model code and the reference Slang shaders are Apache-2.0

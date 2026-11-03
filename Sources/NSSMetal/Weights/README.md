@@ -5,6 +5,13 @@ this repository's Apache-2.0 license. They are licensed by Arm Limited under the
 (`Arm_AI_Model_Community_License_v1_0_PRE-1154.pdf`, included here). By using, copying, modifying or distributing
 them you agree to that license.
 
+## About the model
+
+- Model card and weights: [huggingface.co/Arm/neural-super-sampling](https://huggingface.co/Arm/neural-super-sampling)
+- Paper: [Neural Super Sampling (2025)](https://huggingface.co/Arm/neural-super-sampling/blob/main/2025-neural-super-sampling.pdf)
+- Reference implementation and training (Apache-2.0): [arm/neural-graphics-model-gym](https://github.com/arm/neural-graphics-model-gym), `usecases/nss`
+- [NSS guide](https://developer.arm.com/documentation/111009/latest/) and Arm's [Neural Graphics Development Kit](https://developer.arm.com/mobile-graphics-and-gaming/neural-technology)
+
 ## Source
 
 [huggingface.co/Arm/neural-super-sampling](https://huggingface.co/Arm/neural-super-sampling), commit
