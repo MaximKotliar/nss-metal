@@ -473,6 +473,76 @@ lower-precision history, which drifts. What's left without changing the output i
 layer's padded output channels, conv9 overlapping more of the chain); below ~1.15 ms would take a smaller network or
 a cheaper post-process, both of which change the image.
 
+## Round 6: lossy options for a faster mode
+
+Rounds 1–5 kept the output (within a few 1/255 of Arm's math). This round looks for speed that does change the image,
+as candidates for an optional "fast" mode. Image quality can't be judged against the exact output any more, so it is
+scored against ground truth: the synthetic scene from [quality.md](quality.md) (panning photo, moving and rotating
+spoked wheel, static chain-link fence) with an 8×8-supersampled truth, at TLOU2's Balanced size 1488×928 → 2560×1600,
+frames 24–119 scored. The photo is macOS's default aerial wallpaper (a detailed photo; the Sonoma wallpaper used in
+quality.md is mostly smooth gradients). "Fast" runs the same scene with 4× the motion (panning ~11 px/frame).
+GPU times: the game-like Metal 4 test app (`hook/test/nss_perf.sh`), alternating A/B runs.
+
+Baselines (PSNR on the photo and wheel regions; SSIM on the fence, whose PSNR barely moves between upscalers):
+
+| | GPU | photo | wheel | fence SSIM | fast: photo | fast: wheel |
+|---|---|---|---|---|---|---|
+| MetalFX | 0.47 ms | 36.8 dB | 18.7 dB | 0.311 | 38.3 dB | 18.7 dB |
+| NSS mid | 1.29 ms | 39.8 dB | 19.5 dB | 0.365 | 40.6 dB | 18.3 dB |
+| NSS low | 1.24 ms | 37.0 dB | 18.9 dB | 0.365 | – | – |
+
+NSS's lead is detail on static and slowly moving content (+3 dB on the photo); on the fast wheel MetalFX is already
+slightly ahead. Low's bilinear history gives most of the photo lead away for 0.05 ms.
+
+### 38. Small trims in post and pre — rejected
+
+The diagnostic switches, scored: one filter tap instead of four (`NSS_POST_ABLATE=1`) −0.06 ms, photo −0.9 dB, fence
+−1.8 dB; constant temporal parameters (`=4`) no time saved, photo −1.2 dB; one history tap in pre (`NSS_PRE_ABLATE=2`)
+no time, photo −5.2 dB; no moiré detector (`=1`) no time, no change on this scene. Nothing here is worth a mode.
+
+### 39. Network on every Nth frame — rejected
+
+The other frames reuse the last network outputs (filter weights and temporal parameters); pre-process and post still
+run every frame, so a reuse frame costs ~0.59 ms. Average per frame: every 2nd 0.98 ms, every 3rd 0.86 ms (1.33 ms
+mid in the same Metal 3 runs). Slow scene: no loss. Fast scene: wheel −0.6 dB (every 2nd), −0.3 dB (every 3rd), and
+at every 3rd a visible dotted smear along the moving rim.
+
+- Reading the stale outputs where the pixel was when the network ran (warped by motion × age), and warping the
+  network's recurrent feedback by its real age: no change.
+- The cause is the jitter: the predicted filter weights belong to one sub-pixel offset. With a Halton(2,3) sequence
+  and every 2nd frame, the network only ever sees frames with the horizontal jitter on one side, and the reuse frames
+  apply those weights to the other side. Both the network frames and the reuse frames degrade.
+- Uneven frame cost (0.6 / 1.3 ms) on top. Kept as a patch outside the repo, not in the code.
+
+### 40. Network at a quarter of the input resolution (`NSS_PROC=4`) — candidate
+
+Mid's network already runs at half the input resolution; this runs it at a quarter (372×232 for 1488×928), using
+the same weights. Only pre-process assumed exactly 2×: its history input averages four bilinear taps at the centres of
+the 2×2 sub-blocks (= the 4×4 block), and it writes the nearest-depth motion for all 16 input pixels under each
+process pixel. Post, the depth passes and the network are size-generic.
+
+| | GPU | photo | wheel | fence SSIM | fast: photo | fast: wheel |
+|---|---|---|---|---|---|---|
+| NSS mid | 1.29 ms | 39.8 dB | 19.5 dB | 0.365 | 40.6 dB | 18.3 dB |
+| **quarter** | **0.80–0.83 ms** | **40.3 dB** | 19.5 dB | 0.314–0.320 | 41.0 dB | 17.9 dB |
+| quarter + network every 3rd | ~0.68 ms | 40.3 dB | 19.5 dB | 0.320 | 41.1 dB | 17.6 dB, rim smear |
+| MetalFX | 0.47 ms | 36.8 dB | 18.7 dB | 0.311 | 38.3 dB | 18.7 dB |
+
+- −0.47 ms (−36%). Network 0.68 → 0.26 ms; pre 0.18 → 0.15 ms (it now writes 16 pixels per thread; loading the 7×7
+  depth window once instead of 16 searches gave the same output and no speedup); post unchanged at ~0.39 ms, now
+  half the frame.
+- Photo +0.5 dB over mid, wheel equal, fast wheel −0.4 dB. The fence's structure score drops to MetalFX's level.
+  In the crops, quarter is hard to tell from mid; the fence differs in fine texture, not in visible artifacts.
+- Mid's default path is bit-exact with this switch compiled in (pre's factor is a function constant).
+- Not checked: in game, and its look at 1.5× (DLSS Quality), where the network is relatively more expensive.
+
+### Round 6 summary
+
+The one lossy option worth offering is the quarter-resolution network: ~0.8 ms (MetalFX ~0.47 in this harness,
+~1.17 in TLOU2), keeping NSS's lead on detail but softer on fine static patterns. Skipping network frames costs
+visible artifacts on moving edges for less gain. The next floor is post-process (~0.39 ms), whose cheap cuts all cost
+detail (38).
+
 ## Running total
 
 Upscale GPU time at 1488×928 → 2560×1600 (Metal 4, harness), after each kept experiment:

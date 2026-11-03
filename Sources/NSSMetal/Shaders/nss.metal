@@ -727,7 +727,9 @@ constant float fcH_exposure [[function_constant(65)]];
 constant int fcH_inWpad [[function_constant(66)]];
 constant int fcH_tempWpad [[function_constant(67)]];
 constant bool fcHOn = is_function_constant_defined(fcH_inDims);
-constant int fcPreAblate [[function_constant(68)]];   // diagnostics: 1 no moire detector, 2 one history tap, 4 no packed-offset searches
+constant int fcPreAblate [[function_constant(68)]];
+constant int fcH_F [[function_constant(69)]];   // input pixels per process pixel per axis: 2 (mid/low), 4 (NSS_PROC=4, quarter)
+constant int H_F = is_function_constant_defined(fcH_F) ? fcH_F : 2;   // diagnostics: 1 no moire detector, 2 one history tap, 4 no packed-offset searches
 #define H_inDims (fcHOn ? fcH_inDims : A.inDims)
 #define H_padDims (fcHOn ? fcH_padDims : A.padDims)
 #define H_procDims (fcHOn ? fcH_procDims : A.procDims)
@@ -769,8 +771,11 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
     const float3 unjittered = karis(sampleGameColor(color, unjitterUv, inD, A.colorTexInv) * kx);
 
     // history: average of the four input pixels under this process pixel, each warped by its own dilated motion
-    const int2 hb = clamp(proc * 2, int2(0), inD - 1);
-    const int2 lanes[4] = {hb, min(hb + int2(1, 0), inD - 1), min(hb + int2(0, 1), inD - 1), min(hb + int2(1, 1), inD - 1)};
+    // (quarter: four taps at the centres of the 2x2 sub-blocks, each a bilinear average of its block)
+    const int2 hb = clamp(proc * H_F, int2(0), inD - 1);
+    const int L = H_F / 2;
+    const int2 lanes[4] = {hb, min(hb + int2(L, 0), inD - 1), min(hb + int2(0, L), inD - 1), min(hb + int2(L, L), inD - 1)};
+    const float2 laneC = H_F == 4 ? float2(1.0f) : float2(0.5f);
     float3 warped = 0;
     int2 laneOff[4];   // nearest-depth offsets of the four lanes, reused for post's motion below
     for (int l = 0; l < ((fcPreAblate & 2) ? 1 : 4); ++l)
@@ -781,7 +786,7 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
         nearestLowMid(depth, inD, ic, d, o);
         laneOff[l] = o;
         const float2 m = motionAt(motion, inD, clamp(ic + o, int2(0), inD - 1));
-        const float2 r = (float2(ic) + 0.5f) * invIn - m * invIn;
+        const float2 r = (float2(ic) + laneC) * invIn - m * invIn;
         warped += karis(history.sample(kLinZero, r.yx).rgb * kx);
     }
     warped *= 0.25f;
@@ -804,6 +809,21 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
     if (any(padded >= H_procDims)) return;
     derivOut.write(luma, uint2(padded.y, padded.x));
     ST(disOut, H_procDims, 0, padded, dis);
+    if (H_F != 2)
+    {
+        // quarter: motion at the nearest-depth neighbour for each of the FxF input pixels under this process pixel
+        for (int j = 0; j < H_F * H_F; ++j)
+        {
+            const int2 icq = padded * H_F + int2(j / H_F, j % H_F);
+            if (any(icq >= inD)) continue;
+            float d;
+            int2 o;
+            nearestLowMid(depth, inD, icq, d, o);
+            const int2 dc = clamp(icq + o, int2(0), inD - 1);
+            dilMotion[icq.x * inD.y + icq.y] = motion[dc.x * inD.y + dc.y];
+        }
+        return;
+    }
     // packed nearest offsets of the 2x2 input quad under this process pixel
     const int2 qb = clamp(padded * 2, int2(0), inD - 1);
     const int2 q[4] = {qb, min(qb + int2(0, 1), inD - 1), min(qb + int2(1, 0), inD - 1), min(qb + int2(1, 1), inD - 1)};

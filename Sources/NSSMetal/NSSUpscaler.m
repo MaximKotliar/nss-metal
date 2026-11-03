@@ -44,6 +44,7 @@ static int nss_gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } re
 @interface NssEngine : NSObject {
 @public
     int Hr, Wr, Ho, Wo, Hp, Wp, Hq, Wq, Hd, Wd, quality, kpnCh, taps, idxModH, idxModW, p, frame;
+    int procF;   // input pixels per process pixel per axis: 1 high, 2 mid/low, 4 (NSS_PROC=4) quarter
     BOOL half_;
     float d2v[4];
     id<MTLDevice> dev;
@@ -178,7 +179,9 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibr
     e->dev = dev, e->Wr = wr, e->Hr = hr, e->Wo = wo, e->Ho = ho, e->quality = quality;
     e->half_ = quality < 2;
     e->kpnCh = e->half_ ? 16 : 36, e->taps = e->half_ ? 4 : 9;
-    e->Hq = e->half_ ? hr / 2 : hr, e->Wq = e->half_ ? wr / 2 : wr;
+    // experiment (lossy): NSS_PROC=4 runs mid/low's network at a quarter of the input resolution instead of half
+    e->procF = e->half_ && nssEnv("PROC") && atoi(nssEnv("PROC")) == 4 ? 4 : e->half_ ? 2 : 1;
+    e->Hq = hr / e->procF, e->Wq = wr / e->procF;
     e->Hp = (e->Hq + 7) / 8 * 8, e->Wp = (e->Wq + 7) / 8 * 8;
     e->Hd = e->half_ ? hr / 4 : hr / 2, e->Wd = e->half_ ? wr / 4 : wr / 2;
     e->tensors = [NSMutableArray array];
@@ -405,6 +408,7 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibr
             [hc setConstantValue:&wp[1] type:MTLDataTypeInt atIndex:67];
             const int abl = nssEnv("PRE_ABLATE") ? atoi(nssEnv("PRE_ABLATE")) : 0;
             [hc setConstantValue:&abl type:MTLDataTypeInt atIndex:68];
+            [hc setConstantValue:&e->procF type:MTLDataTypeInt atIndex:69];
             NSError *herr = nil;
             id<MTLFunction> hf = [e->lib newFunctionWithName:@"nss_pre_half" constantValues:hc error:&herr];
             id<MTLComputePipelineState> hp = hf ? [dev newComputePipelineStateWithFunction:hf error:&herr] : nil;
