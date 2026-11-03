@@ -281,6 +281,121 @@ Winograd), through four versions:
 
 Removed (it would only add compile and tuning time at setup).
 
+## Round 3: parity with MetalFX
+
+Measured in the harness's game-like mode (`TEST_GAMELIKE=1`: the game's formats — RG11B10 color and output,
+Depth32Float_Stencil8 depth, a 1×1 exposure texture, motion in UV units, an input-content region), 2000 frames,
+1488×928 → 2560×1600. Same-mode MetalFX: **1.340–1.350 ms**. NSS mid at the start of the round: **1.445 ms**.
+Image checks are against the previous step's final frame at the same frame count.
+
+### 26. Temporal and feedback tensors read as hardware-filtered textures — kept
+
+The last conv's 4 output channels were stored in an 8-channel tensor and read with software bilinear (4 taps per
+channel: 12 loads in post, 16 in pre). The tensor now has 4 channels (the conv epilogue skips the padding
+channels), and an RGBA16F linear texture view over the same buffer is sampled with one hardware-filtered read; the
+tensor's zero border gives the zero-outside behaviour pre needs, and a clamped coordinate gives post's
+clamp-to-edge.
+
+- post 0.418 → 0.393 ms; total **1.445 → 1.420 ms (−0.025)**.
+- Not bit-exact: the filter unit's weight precision. Max 4/255 on 2.2% of pixels, 65 dB against the exact output.
+
+### 27. Game prep and depth scatter fused (mid/low) — kept
+
+game_prep read the game's depth and motion, wrote NSS's copies, and three more passes followed: clear of the
+scatter target, the scatter, and the low-res disocclusion, which re-read 16 depths and motions per thread. Now one
+pass per 4×4 block (when the render size is 4× the quarter-res grid, which DLSS's sizes are) reads the game's
+textures, writes the copies, scatters, and keeps the block's closest depth, its motion and its view-depth range for
+the disocclusion, which reads just that. The scatter target is double-buffered and the disocclusion clears the other
+one for the next frame, so the clear pass is gone too (first frame only). Same candidate order as the separate
+passes, so ties resolve the same way.
+
+- game_prep 0.027 + depth_clear 0.003 + depth_scatter_q 0.027 + disocclusion_lq 0.017 → prep_q 0.030 + disocclusion 0.007,
+  and two fewer barriers.
+- Total **1.420 → 1.380 ms (−0.040)**. Bit-exact (also against `LSFG_NSS_NOFUSE=1`, the old path, in both
+  harness modes).
+
+### 28. Derivative state as a hardware-filtered texture — kept (RGBA16F)
+
+pre reads the previous derivative state five times per pixel (reprojected, plus 4 neighbours for mid/low), each a
+software bilinear over float4. It's now written and sampled through a linear texture over the same buffer.
+
+| Format | Total | pre_half | vs exact |
+|---|---|---|---|
+| RGBA32F (data unchanged, filter-weight precision only) | 1.350 ms | 0.221 | 72 dB, max 4/255 on 0.7% |
+| **RGBA16F** | **1.340 ms** | 0.211 | 71 dB, max 4/255 on 0.9% |
+
+- Total **1.380 → 1.340 ms (−0.040)**, RGBA16F. `LSFG_NSS_DERIV32=1` selects RGBA32F.
+
+### 29. Dilated motion written by pre, read by post (mid/low) — kept
+
+post decoded a packed nearest-depth offset, then read the motion at that neighbour, then sampled history: three
+dependent loads per output pixel. pre already finds the offset for each render pixel, so it now writes that
+neighbour's motion directly (float2, exact) and post reads it in one load. The packed offsets are no longer
+written for mid/low.
+
+- post 0.390 → 0.365, pre_half 0.211 → 0.230 (the extra writes).
+- Total **1.340 → 1.330 ms (−0.010)**. Bit-exact.
+
+### Round 3 total
+
+| After | NSS mid | NSS high | MetalFX (same mode) |
+|---|---|---|---|
+| start of round (game-like mode) | 1.445 ms | – | 1.340 |
+| 26. texture views for temporal/feedback | 1.420 | – | |
+| 27. fused prep + scatter | 1.380 | – | |
+| 28. derivative state as RGBA16F texture | 1.340 | – | |
+| 29. dilated motion from pre | **1.330** | 3.55 | 1.340–1.350 |
+
+Mid reaches MetalFX's GPU time in the harness, −0.115 ms (−8%) this round. Low: 1.30 ms. High: 3.76 → 3.55 ms
+(it shares 26 and 28). Combined drift from the exact output: under 0.004/255 mean, no visible change.
+
+## Round 4: closing the in-game gap
+
+In TLOU2 with the round-3 build: NSS mid 1.33 ms vs MetalFX 1.17 ms at DLSS Balanced, 1.73–1.78 vs 1.26 ms at
+Quality (1712×1072). NSS's cost grows with the render size (the network runs at half of it); MetalFX's barely does.
+
+Finding: the conv layers are bound by math, not memory. Counting multiply-adds per layer (mid at Balanced: 7.2 GFLOP
+for the 14 layers), the big ones run at 12–13 TFLOPS (conv1, conv11), roughly 70–80% of the M4 Max GPU's peak; the
+small low-res ones at 6–8. So fusing layers to save memory traffic, the plan going in, has little to win; less math
+and better use of the GPU in the small layers do.
+
+The machine was noisy during this round (WindowServer using 17–27% of the GPU with nothing running), so results are
+from alternating runs of both settings: `LSFG_NSS_TILES` pins each layer's kernel choice ("PX" or "PXxSPLIT"),
+`LSFG_NSS_NOPACK0` / `LSFG_NSS_NOSPLIT` turn the experiments off.
+
+### 30. conv0 with packed taps — kept
+
+conv0 has 12 input channels, padded to 16 for the 8×8 matrix ops: a quarter of its multiplies were by zero. The
+network input tensor now has 12 channels (pre writes 25% less), and for conv0 the 3 horizontal taps × 12 channels,
+which are contiguous in a channels-last row, are one run of 36 rounded up to 40: 5 matrix blocks per kernel row
+instead of 6 (the 4 extra values hit zero weights). Function constant 19 selects it; the weights are packed again
+for it.
+
+- conv0 0.080 → 0.063 ms at Balanced, 0.129 → 0.089 at Quality; pre_half 0.229 → 0.222. Bit-exact.
+
+### 31. Output-channel split for the small layers — kept
+
+The 1/4- and 1/8-res layers have too few pixels to fill 40 cores (conv4–6: 5,400 pixels, under 700 simdgroups).
+Each simdgroup can now compute OC/2 or OC/4 of the output channels, with the threadgroup's z picking the group, so
+these layers get 2–4× the simdgroups. The setup tuner picks per layer among (pixel tiles, split): (1,1) (2,1) (4,1)
+(1,2) (2,2) (1,4).
+
+- The tuner's isolated timings were noisy enough to pick variants that are slower in the frame; it now takes the best
+  of three rounds and leaves the simplest variant only for one ≥3% faster.
+- Typical pick at Balanced: `4 4 1x4 1x4 1x2 1x2 1x4 1 1x4 1x2 1 2x2 4 4`. Bit-exact.
+
+### Round 4 total
+
+Alternating runs (game-like mode, 1500 frames), round-3 settings vs 30 + 31:
+
+| Size | Round 3 | 30 + 31 | Gain |
+|---|---|---|---|
+| Balanced 1488×928 | 1.414 / 1.421 ms | 1.354 / 1.324 ms | **−0.08 ms** |
+| Quality 1712×1072 | 1.743 / 1.769 ms | 1.636 / 1.641 ms | **−0.12 ms** |
+
+(Absolute numbers include the background GPU load; the quiet-machine Balanced figure for round 3 was 1.33 ms, so
+expect about 1.25 ms there.)
+
 ## Running total
 
 Upscale GPU time at 1488×928 → 2560×1600 (Metal 4, harness), after each kept experiment:

@@ -28,22 +28,15 @@ static inline float LDH(const device half* t, HWC h, int c, int2 p)
 {
     return float(t[(((long)p.x + 1) * h.wpad + p.y + 1) * h.C + c]);
 }
-static float sampleH(const device half* t, HWC h, int c, float2 uv, bool clampEdge)
+
+// A 4-channel padded tensor read through an RGBA16F texture view (texel (col+1, row+1) = pixel (row, col)), so the
+// bilinear filter is done in hardware. clampEdge clamps to the edge pixels, otherwise the zero border gives zeros.
+constexpr sampler kViewLin(filter::linear, address::clamp_to_zero, coord::pixel);
+static inline float4 sampleView(texture2d<float> v, int2 dims, float2 uv, bool clampEdge)
 {
-    const int2 dims = h.dims;
-    const float2 idx = uv * float2(dims);
-    const int2 g0 = int2(floor(idx - 0.5f));
-    const int2 g1 = g0 + 1;
-    float2 w0 = max(1.0f - abs(float2(g0) + 0.5f - idx), 0.0f);
-    float2 w1 = max(1.0f - abs(float2(g1) + 0.5f - idx), 0.0f);
-    if (!clampEdge)
-    {
-        w0 *= float2(g0 >= 0) * float2(g0 < dims);
-        w1 *= float2(g1 >= 0) * float2(g1 < dims);
-    }
-    const int2 c0 = clamp(g0, int2(0), dims - 1), c1 = clamp(g1, int2(0), dims - 1);
-    return LDH(t, h, c, int2(c0.x, c0.y)) * w0.x * w0.y + LDH(t, h, c, int2(c0.x, c1.y)) * w0.x * w1.y +
-           LDH(t, h, c, int2(c1.x, c0.y)) * w1.x * w0.y + LDH(t, h, c, int2(c1.x, c1.y)) * w1.x * w1.y;
+    float2 p = uv * float2(dims);
+    if (clampEdge) p = clamp(p, 0.5f, float2(dims) - 0.5f);
+    return v.sample(kViewLin, (p + 1.0f).yx);
 }
 
 // sample_tensor: bilinear, texel centres at +0.5, clamp-to-edge or zero outside
@@ -389,7 +382,7 @@ static inline float dDelta(float3 a, float3 b, float cw) { return length(float3(
 struct LowMid
 {
     bool on;
-    const device float4* derivTm1;   // interleaved
+    texture2d<float> derivTm1;   // hardware-filtered view of the previous derivative state
     int2 derivDims;
     float2 derivUv, derivStep;      // uv and one-texel step in the derivative tensor
     int2 inputStep;
@@ -418,10 +411,10 @@ static float4 lumaDerivative(texture2d<float> color, int2 dims, int2 ref, float 
         const float3 ts = ycocg(derivColor(color, dims, ref + int2(0, st.y), exposure));
         const float3 te = ycocg(derivColor(color, dims, ref + int2(st.x, 0), exposure));
         const float3 tw = ycocg(derivColor(color, dims, ref + int2(-st.x, 0), exposure));
-        const float4 dn = sampleV4(lm.derivTm1, lm.derivDims, lm.derivUv + float2(0.0f, -lm.derivStep.y), false);
-        const float4 ds = sampleV4(lm.derivTm1, lm.derivDims, lm.derivUv + float2(0.0f, lm.derivStep.y), false);
-        const float4 de = sampleV4(lm.derivTm1, lm.derivDims, lm.derivUv + float2(lm.derivStep.x, 0.0f), false);
-        const float4 dw = sampleV4(lm.derivTm1, lm.derivDims, lm.derivUv + float2(-lm.derivStep.x, 0.0f), false);
+        const float4 dn = lm.derivTm1.sample(kLinZero, (lm.derivUv + float2(0.0f, -lm.derivStep.y)).yx);
+        const float4 ds = lm.derivTm1.sample(kLinZero, (lm.derivUv + float2(0.0f, lm.derivStep.y)).yx);
+        const float4 de = lm.derivTm1.sample(kLinZero, (lm.derivUv + float2(lm.derivStep.x, 0.0f)).yx);
+        const float4 dw = lm.derivTm1.sample(kLinZero, (lm.derivUv + float2(-lm.derivStep.x, 0.0f)).yx);
         const float d_tn = dDelta(tn, dn.xyz, cw), d_ts = dDelta(ts, ds.xyz, cw), d_te = dDelta(te, de.xyz, cw), d_tw = dDelta(tw, dw.xyz, cw);
         const float r_tn = dDelta(c, tn, cw), r_ts = dDelta(c, ts, cw), r_te = dDelta(c, te, cw), r_tw = dDelta(c, tw, cw);
         const float tMax = max(max(dC, d_tn), max(max(d_ts, d_te), d_tw));
@@ -475,9 +468,9 @@ static float4 lumaDerivative(texture2d<float> color, int2 dims, int2 ref, float 
 kernel void nss_pre(constant PreArgs& A [[buffer(0)]],
                     texture2d<float> color [[texture(0)]], const device float* depth [[buffer(2)]],
                     const device float2* motion [[buffer(3)]], texture2d<float> history [[texture(1)]],
-                    const device int* depthTm1 [[buffer(5)]], const device float4* derivTm1 [[buffer(6)]],
-                    const device half* feedbackTm1 [[buffer(7)]],
-                    device half* inputTensor [[buffer(8)]], device float4* derivOut [[buffer(9)]],
+                    const device int* depthTm1 [[buffer(5)]], texture2d<float> derivTm1 [[texture(3)]],
+                    texture2d<float> feedbackView [[texture(2)]],
+                    device half* inputTensor [[buffer(8)]], texture2d<float, access::write> derivOut [[texture(4)]],
                     device float* disOut [[buffer(10)]], device float* nearestOut [[buffer(11)]],
                     const device float* gameK [[buffer(12)]],
                     uint2 gid [[thread_position_in_grid]])
@@ -515,13 +508,11 @@ kernel void nss_pre(constant PreArgs& A [[buffer(0)]],
     const float dis = depthClip(depthTm1, A.depthDims, reproj270, A.renderSize, nearest, A.deviceToView);
     const float3 unjittered = karis(sampleGameColor(color, unjitterUv, inD, A.colorTexInv) * kx);
     const float3 warped = karis(history.sample(kLinZero, reprojUv.yx).rgb * kx);
-    const float4 dTm1 = sampleV4(derivTm1, inD, reprojUv, false);
+    const float4 dTm1 = derivTm1.sample(kLinZero, reprojUv.yx);
     float instability = 0;
     const LowMid noLm = {false, derivTm1, inD, 0, 0, 0};
     const float4 luma = lumaDerivative(color, inD, ref, kx, dTm1, dis, instability, noLm);
-    const HWC fh = {A.padDims, A.tempWpad, 8};
-    float4 fb = float4(sampleH(feedbackTm1, fh, 0, reprojPad, false), sampleH(feedbackTm1, fh, 1, reprojPad, false),
-                       sampleH(feedbackTm1, fh, 2, reprojPad, false), sampleH(feedbackTm1, fh, 3, reprojPad, false));
+    float4 fb = sampleView(feedbackView, A.padDims, reprojPad, false);
     fb = mix(fb, 0.f, float(dis > 0.01f));
     // motion detector
     const float kMin = length(1.0f / A.renderSize), kMax = length(200.0f / A.renderSize);
@@ -529,11 +520,11 @@ kernel void nss_pre(constant PreArgs& A [[buffer(0)]],
 
     const float vals[12] = {warped.r, warped.g, warped.b, unjittered.r, unjittered.g, unjittered.b, motionDet,
                             fb.r, fb.g, fb.b, fb.a, instability};
-    device half* dstIn = inputTensor + (((long)padded.x + 1) * A.inWpad + padded.y + 1) * 16;
+    device half* dstIn = inputTensor + (((long)padded.x + 1) * A.inWpad + padded.y + 1) * 12;
     for (int c = 0; c < 12; ++c) dstIn[c] = half(vals[c]);
 
     if (any(padded >= inD)) return;
-    derivOut[padded.x * inD.y + padded.y] = luma;
+    derivOut.write(luma, uint2(padded.y, padded.x));
     ST(disOut, inD, 0, padded, dis);
     const int2 cl = clamp(nearestOff, int2(-2), int2(2));
     ST(nearestOut, inD, 0, padded, float(((cl.y + 2) << 3) | (cl.x + 2)) / 255.0f);   // EncodeNearestDepthCoord
@@ -578,6 +569,89 @@ kernel void nss_depth_scatter_q(constant ScatterArgs& A [[buffer(0)]],
 }
 
 struct DisLqArgs { float4 d2v; float2 renderSize; int2 inDims; int2 outDims; };
+
+// Mid/low, when the render size is 4x the quarter-res grid: game prep + depth scatter in one pass. Each thread owns
+// one 4x4 block of game pixels: writes NSS's depth / motion for it, scatters it like nss_depth_scatter_q, and keeps
+// what nss_disocclusion_lq needs from the block (closest depth, its motion, view-depth range) in `stats`.
+// The scatter target was cleared by the previous frame's nss_disocclusion_lq_s (double-buffered).
+struct PrepQArgs { GamePrepArgs g; float4 d2v; int2 outDims; };
+static inline float rdDepth(depth2d<float> t, uint2 p) { return t.read(p); }
+static inline float rdDepth(texture2d<float> t, uint2 p) { return t.read(p).r; }
+
+template <typename DT>
+kernel void nss_prep_q(constant PrepQArgs& A [[buffer(0)]], DT depth [[texture(1)]],
+                       texture2d<float> motion [[texture(2)]], texture2d<float> exposure [[texture(3)]],
+                       device float* oDepth [[buffer(2)]], device float2* oMotion [[buffer(3)]], device float* oK [[buffer(4)]],
+                       device atomic_int* out [[buffer(5)]], device float4* stats [[buffer(6)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    const int2 idx = int2(gid.y, gid.x);
+    if (any(idx >= A.outDims)) return;
+    if (gid.x == 0 && gid.y == 0) oK[0] = exposureK(A.g, exposure);
+    const int2 base = idx * 4, inD = A.g.dims;
+    float d[4][4];
+    float2 m[4][4];
+    const float2 ms = A.g.mvScale * (1.0f - A.g.reset);
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+        {
+            const int2 p = base + int2(y, x);
+            const uint2 t = uint2(p.y, p.x);
+            const float dv = rdDepth(depth, t);
+            const float dd = A.g.depthReversed ? 1.0f - dv : dv;
+            const float2 mm = motion.read(t).rg * ms;
+            d[y][x] = dd, m[y][x] = float2(-mm.y, -mm.x);
+            oDepth[p.x * inD.y + p.y] = dd;
+            oMotion[p.x * inD.y + p.y] = m[y][x];
+        }
+    // scatter: the same candidate order as nss_depth_scatter_q (quads, then gather order), later ties win
+    float3 r = float3(m[0][0], d[0][0]);
+    for (int q = 0; q < 4; ++q)
+        for (int k = 0; k < 4; ++k)
+        {
+            if (q == 0 && k == 0) continue;
+            const int y = (q >> 1) * 2 + (k >> 1), x = (q & 1) * 2 + (k & 1);
+            r = mix(r, float3(m[y][x], d[y][x]), step(d[y][x], r.z));
+        }
+    const float2 invOut = 1.0f / float2(A.outDims);
+    const float2 uv = (float2(idx) + 0.5f) * invOut;
+    float2 mv = r.xy * 0.25f;
+    mv *= float(length(r.xy) > 0.1f);
+    mv *= invOut;
+    reconstructPrevDepth(out, A.outDims, uv - mv, r.z);
+    // disocclusion inputs: nss_disocclusion_lq's scan order (row offset fastest), first minimum wins
+    float closest = d[0][0];
+    float2 cmv = m[0][0];
+    float vmin = viewDepth(closest, A.d2v), vmax = vmin;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+        {
+            const float dv = d[x][y], vd = viewDepth(dv, A.d2v);
+            vmin = min(vmin, vd), vmax = max(vmax, vd);
+            if (dv < closest) closest = dv, cmv = m[x][y];
+        }
+    stats[idx.x * A.outDims.y + idx.y] = float4(closest, cmv, vmax - vmin);
+}
+template [[host_name("nss_prep_q")]] kernel void nss_prep_q<texture2d<float>>(constant PrepQArgs&, texture2d<float>, texture2d<float>,
+    texture2d<float>, device float*, device float2*, device float*, device atomic_int*, device float4*, uint2);
+template [[host_name("nss_prep_q_d")]] kernel void nss_prep_q<depth2d<float>>(constant PrepQArgs&, depth2d<float>, texture2d<float>,
+    texture2d<float>, device float*, device float2*, device float*, device atomic_int*, device float4*, uint2);
+
+// nss_disocclusion_lq from nss_prep_q's block stats; also clears the other scatter buffer for next frame
+kernel void nss_disocclusion_lq_s(constant DisLqArgs& A [[buffer(0)]], const device float4* stats [[buffer(1)]],
+                                  device int* clearNext [[buffer(2)]], const device int* depthTm1 [[buffer(3)]],
+                                  device float* out [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    const int2 idx = int2(gid.y, gid.x);
+    if (any(idx >= A.outDims)) return;
+    const int i = idx.x * A.outDims.y + idx.y;
+    clearNext[i] = 0x7fffffff;
+    const float4 st = stats[i];
+    const float2 uv = (float2(idx) + 0.5f) / float2(A.outDims);
+    const float2 mvD = st.yz * (float2(A.outDims) / float2(A.inDims)) * float(length(st.yz) > 0.1f);
+    const float2 reproj = uv - mvD / float2(A.outDims);
+    ST(out, A.outDims, 0, idx, depthClip(depthTm1, A.outDims, reproj, A.renderSize, st.x, A.d2v, st.w));
+}
 kernel void nss_disocclusion_lq(constant DisLqArgs& A [[buffer(0)]],
                                 const device float2* motion [[buffer(1)]], const device float* depth [[buffer(2)]],
                                 const device int* depthTm1 [[buffer(3)]], device float* out [[buffer(4)]],
@@ -665,11 +739,11 @@ constant int fcPreAblate [[function_constant(68)]];   // diagnostics: 1 no moire
 kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
                          texture2d<float> color [[texture(0)]], const device float* depth [[buffer(2)]],
                          const device float2* motion [[buffer(3)]], texture2d<float> history [[texture(1)]],
-                         const device float* disLq [[buffer(5)]], const device float4* derivTm1 [[buffer(6)]],
-                         const device half* feedbackTm1 [[buffer(7)]],
-                         device half* inputTensor [[buffer(8)]], device float4* derivOut [[buffer(9)]],
+                         const device float* disLq [[buffer(5)]], texture2d<float> derivTm1 [[texture(3)]],
+                         texture2d<float> feedbackView [[texture(2)]],
+                         device half* inputTensor [[buffer(8)]], texture2d<float, access::write> derivOut [[texture(4)]],
                          device float* disOut [[buffer(10)]], device float* nearestOut [[buffer(11)]],
-                         const device float* gameK [[buffer(12)]],
+                         const device float* gameK [[buffer(12)]], device float2* dilMotion [[buffer(13)]],
                          uint2 gid [[thread_position_in_grid]])
 {
     const float kx = gameK[0] * H_exposure;
@@ -710,38 +784,36 @@ kernel void nss_pre_half(constant PreHalfArgs& A [[buffer(0)]],
     warped *= 0.25f;
 
     const float2 dStep = 1.0f / float2(H_padDims);
-    const float4 dTm1 = sampleV4(derivTm1, H_padDims, reprojPad, false);
+    const float4 dTm1 = derivTm1.sample(kLinZero, reprojPad.yx);
     const LowMid lm = {!(fcPreAblate & 1), derivTm1, H_padDims, reprojPad, dStep, max(int2(invScale + 0.5f), int2(1))};
     float instability = 0;
     const float4 luma = lumaDerivative(color, inD, ref, kx, dTm1, dis, instability, lm);
-    const HWC fh = {H_padDims, H_tempWpad, 8};
-    float4 fb = float4(sampleH(feedbackTm1, fh, 0, reprojPad, false), sampleH(feedbackTm1, fh, 1, reprojPad, false),
-                       sampleH(feedbackTm1, fh, 2, reprojPad, false), sampleH(feedbackTm1, fh, 3, reprojPad, false));
+    float4 fb = sampleView(feedbackView, H_padDims, reprojPad, false);
     fb = mix(fb, 0.f, float(dis > 0.01f));
     const float kMin = length(1.0f / H_renderSize), kMax = length(200.0f / H_renderSize);
     const float motionDet = sqrt((clamp(length(mv / H_renderSize), kMin, kMax) - kMin) / (kMax - kMin));
 
     const float vals[12] = {warped.r, warped.g, warped.b, unjittered.r, unjittered.g, unjittered.b, motionDet,
                             fb.r, fb.g, fb.b, fb.a, instability};
-    device half* dstIn = inputTensor + (((long)padded.x + 1) * H_inWpad + padded.y + 1) * 16;
+    device half* dstIn = inputTensor + (((long)padded.x + 1) * H_inWpad + padded.y + 1) * 12;
     for (int c = 0; c < 12; ++c) dstIn[c] = half(vals[c]);
 
     if (any(padded >= H_procDims)) return;
-    derivOut[padded.x * H_padDims.y + padded.y] = luma;
+    derivOut.write(luma, uint2(padded.y, padded.x));
     ST(disOut, H_procDims, 0, padded, dis);
     // packed nearest offsets of the 2x2 input quad under this process pixel
     const int2 qb = clamp(padded * 2, int2(0), inD - 1);
     const int2 q[4] = {qb, min(qb + int2(0, 1), inD - 1), min(qb + int2(1, 0), inD - 1), min(qb + int2(1, 1), inD - 1)};
-    uint nb[4];
     for (int l = 0; l < 4; ++l)
     {
         float d;
         int2 o;
         if (fcPreAblate & 4) o = int2(0); else nearestLowMid(depth, inD, q[l], d, o);
-        nb[l] = nibble(o);
+        // post reads the motion at the nearest-depth neighbour straight from here (one load instead of two)
+        const int2 icq = padded * 2 + int2(l >> 1, l & 1);
+        const int2 dc = clamp(icq + o, int2(0), inD - 1);
+        if (all(icq < inD)) dilMotion[icq.x * inD.y + icq.y] = motion[dc.x * inD.y + dc.y];
     }
-    ST(nearestOut, H_padDims, 0, padded, float(nb[0] | (nb[1] << 4)) / 255.0f);
-    ST(nearestOut, H_padDims, 1, padded, float(nb[2] | (nb[3] << 4)) / 255.0f);
 }
 
 // ------------------------------------------------------------------------------------------------ network
@@ -892,8 +964,8 @@ constant bool fcPOn = is_function_constant_defined(fcP_inDims);
 #define P_ablate (fcPOn ? fcP_ablate : A.ablate)
 
 static inline void postPixel(constant PostArgs& A, texture2d<float> color, texture2d<float> history,
-                             const device half* kpn, const device half* temporal, const device float2* motion,
-                             const device float* nearest, const device uint* lut, texture2d<float, access::write> outTex,
+                             const device half* kpn, texture2d<float> temporal, const device float2* motion,
+                             const device float* nearest, const device float2* dilMotion, const device uint* lut, texture2d<float, access::write> outTex,
                              texture2d<float, access::write> gameOut, const device float* gameK, uint2 gid)
 {
     const float kx = gameK[0] * P_exposure;   // the game's exposure / preExposure: NSS's exposure input
@@ -902,7 +974,7 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
     const float2 scale = float2(P_outDims) / float2(P_inDims), invScale = 1.0f / scale;
     const float2 uv = (float2(px) + 0.5f) / float2(P_outDims);
     const float2 kpnScale = float2(P_kpnDims) / float2(P_tempDims);
-    const HWC kh = {P_kpnDims, P_kpnWpad, P_kpnC}, th = {P_tempDims, P_tempWpad, 8};
+    const HWC kh = {P_kpnDims, P_kpnWpad, P_kpnC};
 
     // FilterColor
     const float2 invMod = 1.0f / float2(P_idxMod), invIn = 1.0f / float2(P_inDims);
@@ -943,8 +1015,7 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
 
     // temporal params (padded tensor, sampled in preprocess space)
     const float2 uvT = uv * (float2(P_procDims) / float2(P_tempDims));
-    const float3 tp = (P_ablate & 4) ? float3(0.5f) : float3(sampleH(temporal, th, 0, uvT, true), sampleH(temporal, th, 1, uvT, true),
-                             sampleH(temporal, th, 2, uvT, true));
+    const float3 tp = (P_ablate & 4) ? float3(0.5f) : sampleView(temporal, P_tempDims, uvT, true).xyz;
     const float gamma = tp.z * 2.f;
     const float theta = sharpenTheta(tp.x, 2.f);
     const float alpha = tp.y * 0.35f + 0.05f;
@@ -952,23 +1023,20 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
     // warp history with the dilated motion
     const int2 ic = int2(float2(px) * invScale);
     int2 dil;
+    float2 v;
     if (P_halfRes)
     {
-        const int2 texel = clamp(int2(floor((float2(ic) + 0.5f) * float2(P_procDims) / float2(P_inDims))), int2(0), P_procDims - 1);
-        const float2 pair = float2(LD(nearest, P_nearestDims, 0, texel), LD(nearest, P_nearestDims, 1, texel));
-        const int lane = (ic.x & 1) * 2 + (ic.y & 1);
-        const int byte = lane < 2 ? int(pair.x * 255.0f + 0.5f) : int(pair.y * 255.0f + 0.5f);
-        const int nib = (lane & 1) == 0 ? (byte & 0xF) : ((byte >> 4) & 0xF);
-        dil = int2((nib & 0x3) - 1, ((nib >> 2) & 0x3) - 1);
+        const int2 icl = min(ic, P_inDims - 1);
+        v = dilMotion[icl.x * P_inDims.y + icl.y] * scale;   // nss_pre_half: motion at the nearest-depth neighbour
     }
     else
     {
         const int2 icl = clamp(ic, int2(0), P_inDims - 1);
         const int code = int(LD(nearest, P_nearestDims, 0, icl) * 255.0f + 0.5f);
         dil = int2((code & 0x7) - 2, ((code >> 3) & 0x7) - 2);
+        const int2 dc = clamp(ic + dil, int2(0), P_inDims - 1);
+        v = motion[(dc).x * (P_inDims).y + (dc).y] * scale;
     }
-    const int2 dc = clamp(ic + dil, int2(0), P_inDims - 1);
-    float2 v = motion[(dc).x * (P_inDims).y + (dc).y] * scale;
     v *= float(length(v) > 0.1f);
     const float2 reproj = uv - v / float2(P_outDims);
     const float onscreen = float(all(reproj >= 0.f) && all(reproj <= 1.f));
@@ -990,14 +1058,14 @@ static inline void postPixel(constant PostArgs& A, texture2d<float> color, textu
 
 #define POST_ARGS constant PostArgs& A [[buffer(0)]], \
     texture2d<float> color [[texture(1)]], texture2d<float> history [[texture(2)]], \
-    const device half* kpn [[buffer(3)]], const device half* temporal [[buffer(4)]], \
-    const device float2* motion [[buffer(5)]], const device float* nearest [[buffer(6)]], \
+    const device half* kpn [[buffer(3)]], texture2d<float> temporal [[texture(4)]], \
+    const device float2* motion [[buffer(5)]], const device float* nearest [[buffer(6)]], const device float2* dilMotion [[buffer(8)]], \
     const device uint* lut [[buffer(7)]], texture2d<float, access::write> outTex [[texture(0)]], \
     texture2d<float, access::write> gameOut [[texture(3)]], const device float* gameK [[buffer(9)]]
 
 kernel void nss_post(POST_ARGS, uint2 gid [[thread_position_in_grid]])
 {
-    postPixel(A, color, history, kpn, temporal, motion, nearest, lut, outTex, gameOut, gameK, gid);
+    postPixel(A, color, history, kpn, temporal, motion, nearest, dilMotion, lut, outTex, gameOut, gameK, gid);
 }
 
 
@@ -1024,6 +1092,14 @@ constant int fcStride [[function_constant(15)]];
 constant int fcAct [[function_constant(16)]];
 constant int fcInWpad [[function_constant(17)]];
 constant int fcOutWpad [[function_constant(18)]];
+// packed taps: the 3 horizontal taps x C channels are contiguous in a channels-last row, so one K run of L_IC
+// (3*C rounded up to 8) per kernel row instead of 3 runs of C rounded up (conv0: 5 blocks per row instead of 6)
+constant bool fcPackKx [[function_constant(19)]];
+constant bool kPackKx = is_function_constant_defined(fcPackKx) && fcPackKx;
+// output-channel split: each simdgroup computes OC/split channels and threadgroup z picks the group, so small
+// low-res layers get `split` times the simdgroups (more in flight to hide latency)
+constant int fcOCSplit [[function_constant(20)]];
+constant int kOCSplit = is_function_constant_defined(fcOCSplit) ? fcOCSplit : 1;
 constant bool fcOn = is_function_constant_defined(fcIC);
 #define L_IC (fcOn ? fcIC : A.IC)
 #define L_INC (fcOn ? fcInC : A.inC)
@@ -1054,10 +1130,28 @@ static void epilogue(thread nss_acc8x8* acc, threadgroup nss_acc_t* t, const dev
     for (int e = lane; e < 8 * kOC; e += 32)
     {
         const int j = e / kOC, o = e % kOC;
-        if (j >= valid) continue;
+        if (j >= valid || o >= outC) continue;
         float v = t[e] + bias[o];
         v = act == 0 ? max(v, 0.0f) : 1.0f / (1.0f + exp(-v));
         dst[(long)j * outStep * outC + o] = half(v);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <int NOBG>
+static void epilogueG(thread nss_acc8x8* acc, threadgroup nss_acc_t* t, const device float* bias, device half* dst,
+                      int ocBase, int outC, int valid, int act, ushort lane)
+{
+    constexpr int W = NOBG * 8;
+    for (int ob = 0; ob < NOBG; ++ob) simdgroup_store(acc[ob], t + ob * 8, W);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = lane; e < 8 * W; e += 32)
+    {
+        const int j = e / W, o = ocBase + e % W;
+        if (j >= valid || o >= outC) continue;
+        float v = t[e] + bias[o];
+        v = act == 0 ? max(v, 0.0f) : 1.0f / (1.0f + exp(-v));
+        dst[(long)j * outC + o] = half(v);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -1070,11 +1164,12 @@ template <int kOC, int PX>
 kernel void nss_conv_mma(constant MmaArgs& A [[buffer(0)]], const device half* in [[buffer(1)]],
                          const device half* w [[buffer(2)]], const device float* bias [[buffer(3)]],
                          device half* out [[buffer(4)]], threadgroup nss_acc_t* tile [[threadgroup(0)]],
-                         uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                         uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
                          ushort lane [[thread_index_in_simdgroup]])
 {
     static_assert(kOC % 8 == 0, "OC must be a multiple of 8");
     constexpr int NOB = kOC / 8;
+    const int NOBG = NOB / kOCSplit, ob0 = int(tg.z) * NOBG;
     const int row = tg.y;
     const int col0 = (int(tg.x) * 4 + sg) * 8 * PX;
     if (col0 >= A.wOut) return;
@@ -1083,18 +1178,18 @@ kernel void nss_conv_mma(constant MmaArgs& A [[buffer(0)]], const device half* i
         for (int i = 0; i < NOB; ++i) acc[p][i] = nss_acc8x8(0);
     const ulong aStride = (ulong)L_INC * L_STRIDE;
     for (int ky = 0; ky < 3; ++ky)
-        for (int kx = 0; kx < 3; ++kx)
+        for (int kx = 0; kx < (kPackKx ? 1 : 3); ++kx)
         {
             const device half* base = in + ((long)(row * L_STRIDE + ky) * L_INWPAD + col0 * L_STRIDE + kx) * L_INC + L_INCOFF;
-            const device half* wt = w + (ky * 3 + kx) * L_IC * kOC;
+            const device half* wt = w + (kPackKx ? ky : ky * 3 + kx) * L_IC * kOC;
             for (int cb = 0; cb < L_IC; cb += 8)
             {
                 simdgroup_half8x8 a[PX];
                 for (int p = 0; p < PX; ++p) simdgroup_load(a[p], base + (long)p * 8 * aStride + cb, aStride);
-                for (int ob = 0; ob < NOB; ++ob)
+                for (int ob = 0; ob < NOBG; ++ob)
                 {
                     simdgroup_half8x8 b;
-                    simdgroup_load(b, wt + cb * kOC + ob * 8, kOC);
+                    simdgroup_load(b, wt + cb * kOC + (ob0 + ob) * 8, kOC);
                     for (int p = 0; p < PX; ++p) simdgroup_multiply_accumulate(acc[p][ob], a[p], b, acc[p][ob]);
                 }
             }
@@ -1104,7 +1199,10 @@ kernel void nss_conv_mma(constant MmaArgs& A [[buffer(0)]], const device half* i
         const int c = col0 + p * 8;
         if (c >= A.wOut) break;
         device half* dst = out + ((long)(row + 1) * L_OUTWPAD + c + 1) * L_OUTC + L_OUTCOFF;
-        epilogue<kOC>(acc[p], tile + sg * 8 * kOC, bias, dst, L_OUTC, 1, min(8, A.wOut - c), L_ACT, lane);
+        if (kOCSplit == 1) epilogue<kOC>(acc[p], tile + sg * 8 * kOC, bias, dst, L_OUTC, 1, min(8, A.wOut - c), L_ACT, lane);
+        else if (NOBG == 1) epilogueG<1>(acc[p], tile + sg * 8 * kOC, bias, dst, ob0 * 8, L_OUTC, min(8, A.wOut - c), L_ACT, lane);
+        else if (NOBG == 2) epilogueG<2>(acc[p], tile + sg * 8 * kOC, bias, dst, ob0 * 8, L_OUTC, min(8, A.wOut - c), L_ACT, lane);
+        else epilogueG<4>(acc[p], tile + sg * 8 * kOC, bias, dst, ob0 * 8, L_OUTC, min(8, A.wOut - c), L_ACT, lane);
     }
 }
 
@@ -1156,7 +1254,7 @@ kernel void nss_upconv_mma(constant MmaArgs& A [[buffer(0)]], const device half*
 }
 
 #define CONV_INST_PX(N, P) \
-    template [[host_name("nss_conv_mma_" #N "_p" #P)]] kernel void nss_conv_mma<N, P>(constant MmaArgs&, const device half*, const device half*, const device float*, device half*, threadgroup nss_acc_t*, uint2, ushort, ushort);
+    template [[host_name("nss_conv_mma_" #N "_p" #P)]] kernel void nss_conv_mma<N, P>(constant MmaArgs&, const device half*, const device half*, const device float*, device half*, threadgroup nss_acc_t*, uint3, ushort, ushort);
 #define UPCONV_INST_PX(N, P) \
     template [[host_name("nss_upconv_mma_" #N "_p" #P)]] kernel void nss_upconv_mma<N, P>(constant MmaArgs&, const device half*, const device half*, const device float*, device half*, threadgroup nss_acc_t*, uint2, ushort, ushort);
 #define CONV_INST(N) \

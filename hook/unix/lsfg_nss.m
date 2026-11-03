@@ -27,8 +27,13 @@ static int nss_gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } re
     BOOL half_;
     float d2v[4];
     id<MTLDevice> dev;
-    id<MTLComputePipelineState> gprep, gprepD, dclear, dscatter, dscatterQ, disLq, pre, preHalf, post;
+    id<MTLComputePipelineState> prepQ, prepQD, disLqS, gprep, gprepD, dclear, dscatter, dscatterQ, disLq, pre, preHalf, post;
     NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *conv, *upconv;
+    id<MTLBuffer> depthTm1Alt, blockStats;   // fused mid/low prep (nss_prep_q): second scatter target, per-block stats
+    BOOL fusedPrep;
+    BOOL packConv0;    // conv0 with packed horizontal taps (nss_conv_mma, fcPackKx), weights at pack0Off
+    size_t pack0Off;
+    id<MTLBuffer> dilMotion;   // mid/low: motion at each render pixel's nearest-depth neighbour (nss_pre_half -> nss_post)
     id<MTLBuffer> weights, biases, depth, motion, depthTm1, dis, disLqB, nearest, kBuf, deriv[2], lut, lutMap;
     id<MTLComputePipelineState> lutClear, lutScatter, lutSelect;
     // offset LUTs kept per jitter value (DLSS cycles through a fixed set): slot -> built once
@@ -40,8 +45,11 @@ static int nss_gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } re
     float lutWgt[36];
     NSMutableArray<id<MTLBuffer>> *tensors;   // keeps the NssT buffers alive
     NssT IN, A0, CAT10, A2, CAT8, A4, A5, A6, A8, KPN, A10, A11, TEMP[2];
+    id<MTLTexture> tempView[2];
+    id<MTLTexture> derivTex[2];   // linear textures over deriv[], so the derivative reads filter in hardware   // RGBA16F views over TEMP, so the temporal/feedback reads filter in hardware
     NssLayer layers[14];
-    int layerPX[14];                      // pixel tiles per simdgroup, picked by timing at setup
+    int layerPX[14];
+    int layerSplit[14];                   // output-channel groups (threadgroup z), picked with layerPX                      // pixel tiles per simdgroup, picked by timing at setup
     id<MTLComputePipelineState> layerPSO[14];   // that variant compiled with the layer's shape as function constants
     id<MTLLibrary> lib;
     id<MTLTexture> history[2], dummy;
@@ -173,6 +181,7 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
         return s;
     };
     e->gprep = pso(@"nss_game_prep"), e->gprepD = pso(@"nss_game_prep_d");
+    e->prepQ = pso(@"nss_prep_q"), e->prepQD = pso(@"nss_prep_q_d"), e->disLqS = pso(@"nss_disocclusion_lq_s");
     e->dclear = pso(@"nss_depth_clear"), e->dscatter = pso(@"nss_depth_scatter"), e->dscatterQ = pso(@"nss_depth_scatter_q");
     e->disLq = pso(@"nss_disocclusion_lq"), e->pre = pso(@"nss_pre"), e->preHalf = pso(@"nss_pre_half"), e->post = pso(@"nss_post");
     e->conv = [NSMutableDictionary dictionary], e->upconv = [NSMutableDictionary dictionary];
@@ -200,6 +209,9 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
         const int icp = (shape[li][0] + 7) / 8 * 8, ocp = (shape[li][1] + 7) / 8 * 8;
         total += (size_t)((li == 7 || li == 10 || li == 13) ? 16 : 9) * icp * ocp, btotal += ocp;
     }
+    // conv0 again with packed taps: [ky][kx * 12 + ic, rounded up to 40][oc]
+    e->pack0Off = total;
+    total += (size_t)3 * 40 * 32;
     _Float16 *packed = calloc(total, sizeof(_Float16));
     float *bias = calloc(btotal, sizeof(float));
     size_t so = 0, wo_ = 0, bo = 0;
@@ -212,6 +224,11 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
                 for (int i = 0; i < l.ic; i++)
                     for (int t = 0; t < 9; t++) packed[l.wOff + ((size_t)t * l.icp + i) * l.ocp + o] = (_Float16)NSS_W(o, i, t / 3, t % 3);
             wo_ += (size_t)9 * l.icp * l.ocp;
+            if (li == 0)
+                for (int o = 0; o < l.oc; o++)
+                    for (int i = 0; i < l.ic; i++)
+                        for (int t = 0; t < 9; t++)
+                            packed[e->pack0Off + ((size_t)(t / 3) * 40 + (t % 3) * 12 + i) * 32 + o] = (_Float16)NSS_W(o, i, t / 3, t % 3);
         } else {
             // phase p: tap 0 <- k0 (p=0) or k0+k1 (p=1); tap 1 <- k1+k2 (p=0) or k2 (p=1)
             for (int py = 0; py < 2; py++) for (int px = 0; px < 2; px++)
@@ -244,16 +261,38 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
     const size_t R = (size_t)hr * wr, P = (size_t)e->Hp * e->Wp;
     e->depth = buf(R), e->motion = buf(2 * R);
     e->depthTm1 = buf((size_t)e->Hd * e->Wd), e->disLqB = buf((size_t)e->Hd * e->Wd);
-    e->dis = buf(R), e->nearest = buf(e->half_ ? 2 * P : R), e->kBuf = buf(1);
-    for (int i = 0; i < 2; i++) e->deriv[i] = buf(4 * (e->half_ ? P : R));
+    e->fusedPrep = e->half_ && hr == 4 * e->Hd && wr == 4 * e->Wd && e->prepQ && e->prepQD && e->disLqS && !getenv("LSFG_NSS_NOFUSE");
+    if (e->fusedPrep) e->depthTm1Alt = buf((size_t)e->Hd * e->Wd), e->blockStats = buf((size_t)e->Hd * e->Wd * 4);
+    e->dis = buf(R), e->nearest = buf(e->half_ ? 2 * P : R), e->kBuf = buf(1), e->dilMotion = buf(2 * R);
+    {
+        // derivative state: RGBA16F (LSFG_NSS_DERIV32=1: RGBA32F, 0.01 ms slower; both differ from the float buffer by < 0.004/255 mean)
+        const BOOL f32 = dev.supports32BitFloatFiltering && getenv("LSFG_NSS_DERIV32");
+        const MTLPixelFormat fmt = f32 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA16Float;
+        const int dh = e->half_ ? e->Hp : hr, dw = e->half_ ? e->Wp : wr;
+        const NSUInteger al = [dev minimumLinearTextureAlignmentForPixelFormat:fmt];
+        const NSUInteger pitch = ((NSUInteger)dw * (f32 ? 16 : 8) + al - 1) / al * al;
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:dw height:dh mipmapped:NO];
+        dd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, dd.storageMode = MTLStorageModePrivate;
+        for (int i = 0; i < 2; i++) {
+            e->deriv[i] = buf(pitch * dh / 4);
+            e->derivTex[i] = [e->deriv[i] newTextureWithDescriptor:dd offset:0 bytesPerRow:pitch];
+        }
+    }
     const int Hp = e->Hp, Wp = e->Wp;
-    e->IN = nssTensor(e, Hp, Wp, 16);
+    e->IN = nssTensor(e, Hp, Wp, 12);   // 12 network inputs; conv0 reads 16 (or packed 40) with zero weights past them
     e->A0 = nssTensor(e, Hp / 2, Wp / 2, 32), e->CAT10 = nssTensor(e, Hp / 2, Wp / 2, 48);
     e->A2 = nssTensor(e, Hp / 4, Wp / 4, 32), e->CAT8 = nssTensor(e, Hp / 4, Wp / 4, 48);
     e->A4 = nssTensor(e, Hp / 8, Wp / 8, 64), e->A5 = nssTensor(e, Hp / 8, Wp / 8, 64), e->A6 = nssTensor(e, Hp / 8, Wp / 8, 32);
     e->A8 = nssTensor(e, Hp / 4, Wp / 4, 32), e->KPN = nssTensor(e, Hp / 4, Wp / 4, (e->kpnCh + 7) / 8 * 8);
     e->A10 = nssTensor(e, Hp / 2, Wp / 2, 16), e->A11 = nssTensor(e, Hp / 2, Wp / 2, 16);
-    e->TEMP[0] = nssTensor(e, Hp, Wp, 8), e->TEMP[1] = nssTensor(e, Hp, Wp, 8);
+    e->TEMP[0] = nssTensor(e, Hp, Wp, 4), e->TEMP[1] = nssTensor(e, Hp, Wp, 4);
+    {
+        MTLTextureDescriptor *vd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:e->TEMP[0].wpad height:Hp + 4 mipmapped:NO];
+        vd.usage = MTLTextureUsageShaderRead, vd.storageMode = MTLStorageModePrivate;
+        if ((e->TEMP[0].wpad * 8) % [dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA16Float]) return nil;
+        for (int i = 0; i < 2; i++) e->tempView[i] = [e->TEMP[i].b newTextureWithDescriptor:vd offset:0 bytesPerRow:e->TEMP[i].wpad * 8];
+    }
 
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:wo height:ho mipmapped:NO];
     td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
@@ -288,8 +327,9 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
         e->residency = [dev newResidencySetWithDescriptor:rd error:nil];
         e->gameResidency = [dev newResidencySetWithDescriptor:rd error:nil];
         NSMutableArray *all = [NSMutableArray arrayWithArray:e->tensors];
-        [all addObjectsFromArray:@[e->weights, e->biases, e->depth, e->motion, e->depthTm1, e->dis, e->disLqB, e->nearest, e->kBuf,
-                                   e->deriv[0], e->deriv[1], e->history[0], e->history[1], e->dummy]];
+        [all addObjectsFromArray:@[e->weights, e->biases, e->depth, e->motion, e->depthTm1, e->dis, e->disLqB, e->nearest, e->kBuf, e->dilMotion,
+                                   e->depthTm1Alt ?: e->dummy, e->blockStats ?: e->dummy,
+                                   e->deriv[0], e->deriv[1], e->history[0], e->history[1], e->dummy, e->tempView[0], e->tempView[1], e->derivTex[0], e->derivTex[1]]];
         [all addObject:e->lut], [all addObject:e->lutMap], [all addObject:e->lutCache];
         for (int i = 0; i < 3; i++) [all addObject:e->upload[i]];
         for (id<MTLAllocation> a in all) [e->residency addAllocation:a];
@@ -316,6 +356,7 @@ static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, int wr, in
     [be endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    e->packConv0 = !(getenv("LSFG_NSS_SPECIALIZE") && getenv("LSFG_NSS_SPECIALIZE")[0] == '0') && !getenv("LSFG_NSS_NOPACK0");
     nssTune(e, q);
     // post-process compiled for this engine: fixed sizes and quality switches as function constants (30+)
     if (!(getenv("LSFG_NSS_SPECIALIZE") && getenv("LSFG_NSS_SPECIALIZE")[0] == '0')) {
@@ -453,14 +494,15 @@ static void nssEncodeConv(NssEngine *e, NssEnc *c, NssConv k, int px) {
     const int h = k.upc ? k.in.H : k.out.H, w = k.upc ? k.in.W : k.out.W;   // upconv: grid over the low-res source
     MmaArgs m = {h, w, k.in.wpad, k.in.C, k.inCoff, k.out.wpad, k.out.C, k.outCoff, l.icp, k.stride, k.act};
     id<MTLComputePipelineState> special = e->layerPSO[k.li];
-    [c setComputePipelineState:special && px == e->layerPX[k.li] ? special : (k.upc ? e->upconv : e->conv)[@(l.ocp * 10 + px)]];
+    const BOOL useSpecial = special && px == e->layerPX[k.li];
+    [c setComputePipelineState:useSpecial ? special : (k.upc ? e->upconv : e->conv)[@(l.ocp * 10 + px)]];
     [c setBytes:&m length:sizeof(m) atIndex:0];
     [c setBuffer:k.in.b offset:0 atIndex:1];
-    [c setBuffer:e->weights offset:l.wOff * 2 atIndex:2];
+    [c setBuffer:e->weights offset:(k.li == 0 && e->packConv0 && useSpecial ? e->pack0Off : l.wOff) * 2 atIndex:2];
     [c setBuffer:e->biases offset:l.bOff * 4 atIndex:3];
     [c setBuffer:k.out.b offset:0 atIndex:4];
     [c setThreadgroupMemoryLength:4 * 8 * l.ocp * 4 atIndex:0];
-    [c dispatchThreadgroups:MTLSizeMake((w + 32 * px - 1) / (32 * px), h, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [c dispatchThreadgroups:MTLSizeMake((w + 32 * px - 1) / (32 * px), h, useSpecial ? MAX(e->layerSplit[k.li], 1) : 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 }
 
 // Picks each layer's pixel tiles per simdgroup (1, 2 or 4) by timing them on this GPU at this size.
@@ -471,19 +513,26 @@ static void nssTune(NssEngine *e, id<MTLCommandQueue> q) {
     nssConvs(e, 0, convs);
     const BOOL specialize = !(getenv("LSFG_NSS_SPECIALIZE") && getenv("LSFG_NSS_SPECIALIZE")[0] == '0');
     NssConv *cv = convs;   // blocks can't capture C arrays
-    // variants per layer: 1, 2, 4 pixel tiles
-    NSMutableArray *cands = [NSMutableArray arrayWithCapacity:42];   // [layer * 3 + variant], NSNull if missing
-    for (int n = 0; n < 42; n++) [cands addObject:NSNull.null];
+    // variants per layer: (pixel tiles, output-channel groups); splits only for plain convs with enough channels
+    enum { NV = 6 };
+    static const int vPx[NV] = {1, 2, 4, 1, 2, 1}, vSplit[NV] = {1, 1, 1, 2, 2, 4};
+    const BOOL trySplit = !getenv("LSFG_NSS_NOSPLIT");
+    NSMutableArray *cands = [NSMutableArray arrayWithCapacity:14 * NV];   // [layer * NV + variant], NSNull if missing
+    for (int n = 0; n < 14 * NV; n++) [cands addObject:NSNull.null];
     CFTimeInterval t0 = CACurrentMediaTime();
     if (specialize) {
         NSLock *lock = [NSLock new];
-        dispatch_apply(42, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t n) {
-            const int i = (int)n / 3, px = 1 << (n % 3);
+        dispatch_apply(14 * NV, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t n) {
+            const int i = (int)n / NV, px = vPx[n % NV], split = vSplit[n % NV];
             const NssConv k = cv[i];
             const NssLayer l = e->layers[i];
+            if (split > 1 && (!trySplit || k.upc || l.ocp / 8 < split * 1 || (l.ocp / 8) % split)) return;
             MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new];
-            int shapeVals[9] = {l.icp, k.in.C, k.inCoff, k.out.C, k.outCoff, k.stride, k.act, k.in.wpad, k.out.wpad};
+            const BOOL pack = i == 0 && e->packConv0;
+            int shapeVals[9] = {pack ? 40 : l.icp, k.in.C, k.inCoff, k.out.C, k.outCoff, k.stride, k.act, k.in.wpad, k.out.wpad};
             for (int j = 0; j < 9; j++) [fc setConstantValue:&shapeVals[j] type:MTLDataTypeInt atIndex:10 + j];
+            if (pack) { const bool yes = true; [fc setConstantValue:&yes type:MTLDataTypeBool atIndex:19]; }
+            if (split > 1) [fc setConstantValue:&split type:MTLDataTypeInt atIndex:20];
             NSError *err = nil;
             NSString *name = [NSString stringWithFormat:@"nss_%@conv_mma_%d_p%d", k.upc ? @"up" : @"", l.ocp, px];
             id<MTLFunction> f = [e->lib newFunctionWithName:name constantValues:fc error:&err];
@@ -496,18 +545,29 @@ static void nssTune(NssEngine *e, id<MTLCommandQueue> q) {
     }
     const double compileMs = (CACurrentMediaTime() - t0) * 1e3;
     id<MTLComputePipelineState> (^cand)(int, int) = ^id<MTLComputePipelineState>(int i, int v) {
-        id x = cands[i * 3 + v];
+        id x = cands[i * NV + v];
         return x == NSNull.null ? nil : x;
     };
     NSMutableString *picked = [NSMutableString string];
+    int forced[14][2] = {{0}};
+    if (getenv("LSFG_NSS_TILES")) {
+        NSArray *f = [@(getenv("LSFG_NSS_TILES")) componentsSeparatedByString:@" "];
+        for (int i = 0; i < 14 && i < (int)f.count; i++) {
+            NSArray *ps = [f[i] componentsSeparatedByString:@"x"];
+            forced[i][0] = [ps[0] intValue], forced[i][1] = ps.count > 1 ? [ps[1] intValue] : 1;
+        }
+    }
     for (int i = 0; i < 14; i++) {
         double best = 1e9;
-        int bestPx = 1;
+        int bestPx = 1, bestSplit = 1;
         id<MTLComputePipelineState> bestPso = nil;
-        for (int round = 0; round < 2; round++)          // round 0 warms up
-            for (int v = 0; v < 3; v++) {
-                const int px = 1 << v;
-                e->layerPSO[i] = cand(i, v), e->layerPX[i] = px;   // nssEncodeConv uses layerPSO when px matches
+        double vBest[NV];
+        for (int v = 0; v < NV; v++) vBest[v] = 1e9;
+        for (int round = 0; round < 4; round++)          // round 0 warms up; best of rounds 1-3 per variant
+            for (int v = 0; v < NV; v++) {
+                const int px = vPx[v];
+                if (vSplit[v] > 1 && !cand(i, v)) continue;
+                e->layerPSO[i] = cand(i, v), e->layerPX[i] = px, e->layerSplit[i] = vSplit[v];   // used when px matches
                 id<MTLCommandBuffer> cb = [q commandBuffer];
                 NssEnc *c = [NssEnc new];
                 c->m3 = [cb computeCommandEncoder];
@@ -516,13 +576,21 @@ static void nssTune(NssEngine *e, id<MTLCommandQueue> q) {
                 [cb commit];
                 [cb waitUntilCompleted];
                 const double t = cb.GPUEndTime - cb.GPUStartTime;
-                if (round == 1 && t < best) best = t, bestPx = px, bestPso = cand(i, v);
-                if (round == 1 && getenv("LSFG_NSS_TUNE_LOG"))
-                    lsfg_log(@"nss: tune layer %d variant px%d: %.1f us per dispatch", i, px, t * 1e6 / 8);
+                if (round > 0) vBest[v] = MIN(vBest[v], t);
+                if (round == 3) {
+                    // switch from an earlier (simpler) variant only when clearly faster: isolated timings are noisy
+                    if (vBest[v] < best * 0.97) best = vBest[v], bestPx = px, bestSplit = vSplit[v], bestPso = cand(i, v);
+                    if (getenv("LSFG_NSS_TUNE_LOG"))
+                        lsfg_log(@"nss: tune layer %d variant px%d split%d: %.1f us per dispatch", i, px, vSplit[v], vBest[v] * 1e6 / 8);
+                }
             }
-        e->layerPX[i] = bestPx, e->layerPSO[i] = bestPso;
+        if (forced[i][0]) {   // LSFG_NSS_TILES: fixed choice per layer ("PX" or "PXxSPLIT"), for A/B tests
+            for (int v = 0; v < NV; v++)
+                if (vPx[v] == forced[i][0] && vSplit[v] == forced[i][1] && cand(i, v)) bestPx = vPx[v], bestSplit = vSplit[v], bestPso = cand(i, v);
+        }
+        e->layerPX[i] = bestPx, e->layerPSO[i] = bestPso, e->layerSplit[i] = bestPso ? bestSplit : 1;
         if (bestPso) @synchronized(NSNull.null) { [psoNames setObject:[NSString stringWithFormat:@"conv%d", i] forKey:bestPso]; }
-        [picked appendFormat:@" %d", bestPx];
+        [picked appendFormat:e->layerSplit[i] > 1 ? @" %dx%d" : @" %d", bestPx, e->layerSplit[i]];
     }
     lsfg_log(@"nss: tuned conv layers (pixel tiles:%@), %s, compiled in %.0f ms, total %.0f ms", picked,
              specialize ? "specialized" : "generic", compileMs, (CACurrentMediaTime() - t0) * 1e3);
@@ -616,59 +684,100 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
     // game inputs
     struct { int dims[2]; float reset; int pad0 /* Metal aligns float2 to 8 bytes */; float mvScale[2]; int depthReversed; float preExposureInv; int hasExposure; } ga =
         {{Hr, Wr}, resetF, 0, {fr->mvScale[0], fr->mvScale[1]}, fr->depthReversed, fr->preExposure > 0 ? 1.0f / fr->preExposure : 1.0f, fr->exposure != nil};
-    [c setBytes:&ga length:sizeof(ga) atIndex:0];
-    [c setTexture:fr->color atIndex:0], [c setTexture:fr->depth atIndex:1], [c setTexture:fr->motion atIndex:2];
-    [c setTexture:fr->exposure ?: e->dummy atIndex:3];
-    [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->motion offset:0 atIndex:3], [c setBuffer:e->kBuf offset:0 atIndex:4];
-    grid(isDepthFormat(fr->depth.pixelFormat) ? e->gprepD : e->gprep, Wr, Hr);
-
-    // Offset LUT for this frame's jitter and the depth scatter are independent chains: on Metal 4 each LUT pass
-    // shares a barrier slot with a depth pass (overlapNext), instead of each waiting for the other.
     const int gh = nss_gcd(Hr, Ho), gw = nss_gcd(Wr, Wo);
     struct { float jitter[2], scale[2]; int lo[2], hi[2]; int taps; } la =
         {{fr->jy, fr->jx}, {(float)Ho / Hr, (float)Wo / Wr}, {Hr / gh, Wr / gw}, {Ho / gh, Wo / gw}, e->taps};
     struct { int in[2], out[2]; } sa = {{Hr, Wr}, {Hd, Wd}};
-    if (buildLut) {
-        // slot 1 (alongside game prep, which neither reads): clear both
-        c->overlapNext = YES;
-        [c setBytes:&la length:sizeof(la) atIndex:0];
-        [c setBuffer:e->lutMap offset:0 atIndex:1];
-        [c setComputePipelineState:e->lutClear];
-        [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        c->overlapNext = YES;
-    }
-    [c setBytes:&sa length:sizeof(sa) atIndex:0];
-    [c setBuffer:e->depthTm1 offset:0 atIndex:1];
-    grid(e->dclear, Wd, Hd);
-    if (buildLut) {   // slot 2: scatter both
-        [c setBytes:&la length:sizeof(la) atIndex:0];
-        [c setBuffer:e->lutMap offset:0 atIndex:1];
-        grid(e->lutScatter, la.lo[1], la.lo[0]);
-        c->overlapNext = YES;
-    }
-    [c setBytes:&sa length:sizeof(sa) atIndex:0];
-    [c setBuffer:e->motion offset:0 atIndex:1], [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->depthTm1 offset:0 atIndex:3];
-    grid(e->half_ ? e->dscatterQ : e->dscatter, Wd, Hd);
-    if (buildLut) {   // slot 3: LUT selection (+ low-res disocclusion for mid/low)
-        [c setBytes:&la length:sizeof(la) atIndex:0];
-        [c setBuffer:e->lutMap offset:0 atIndex:1];
-        [c setBytes:e->lutWgt length:sizeof(e->lutWgt) atIndex:2];
-        [c setBuffer:lutB offset:lutOff atIndex:3];
-        [c setComputePipelineState:e->lutSelect];
-        [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    }
-    if (e->half_) {
-        if (buildLut) c->overlapNext = YES;
+    if (e->fusedPrep) {
+        // game prep + depth scatter in one pass; disocclusion from its block stats (it also clears next frame's target)
+        id<MTLBuffer> dTm = p ? e->depthTm1Alt : e->depthTm1, dNext = p ? e->depthTm1 : e->depthTm1Alt;
+        if (e->frame == 0) {
+            [c setBytes:&sa length:sizeof(sa) atIndex:0];
+            [c setBuffer:dTm offset:0 atIndex:1];
+            grid(e->dclear, Wd, Hd);
+        }
+        struct { typeof(ga) g; int pad1[3]; float d2v[4]; int out[2], pad2[2]; } qa_ = {ga, {0}, {e->d2v[0], e->d2v[1], e->d2v[2], e->d2v[3]}, {Hd, Wd}, {0}};
+        _Static_assert(sizeof(ga) == 36, "GamePrepArgs");
+        [c setBytes:&qa_ length:sizeof(qa_) atIndex:0];
+        [c setTexture:fr->depth atIndex:1], [c setTexture:fr->motion atIndex:2], [c setTexture:fr->exposure ?: e->dummy atIndex:3];
+        [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->motion offset:0 atIndex:3], [c setBuffer:e->kBuf offset:0 atIndex:4];
+        [c setBuffer:dTm offset:0 atIndex:5], [c setBuffer:e->blockStats offset:0 atIndex:6];
+        grid(isDepthFormat(fr->depth.pixelFormat) ? e->prepQD : e->prepQ, Wd, Hd);
+        if (buildLut) {
+            c->overlapNext = YES;
+            [c setBytes:&la length:sizeof(la) atIndex:0];
+            [c setBuffer:e->lutMap offset:0 atIndex:1];
+            [c setComputePipelineState:e->lutClear];
+            [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            grid(e->lutScatter, la.lo[1], la.lo[0]);
+            c->overlapNext = YES;
+        }
         struct { float d2v[4]; float renderSize[2]; int in[2], out[2]; } da =
             {{e->d2v[0], e->d2v[1], e->d2v[2], e->d2v[3]}, {(float)Hr, (float)Wr}, {Hr, Wr}, {Hd, Wd}};
         [c setBytes:&da length:sizeof(da) atIndex:0];
-        [c setBuffer:e->motion offset:0 atIndex:1], [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->depthTm1 offset:0 atIndex:3];
+        [c setBuffer:e->blockStats offset:0 atIndex:1], [c setBuffer:dNext offset:0 atIndex:2], [c setBuffer:dTm offset:0 atIndex:3];
         [c setBuffer:e->disLqB offset:0 atIndex:4];
-        grid(e->disLq, Wd, Hd);
+        grid(e->disLqS, Wd, Hd);
+        if (buildLut) {
+            [c setBytes:&la length:sizeof(la) atIndex:0];
+            [c setBuffer:e->lutMap offset:0 atIndex:1];
+            [c setBytes:e->lutWgt length:sizeof(e->lutWgt) atIndex:2];
+            [c setBuffer:lutB offset:lutOff atIndex:3];
+            [c setComputePipelineState:e->lutSelect];
+            [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+    } else {
+        [c setBytes:&ga length:sizeof(ga) atIndex:0];
+        [c setTexture:fr->color atIndex:0], [c setTexture:fr->depth atIndex:1], [c setTexture:fr->motion atIndex:2];
+        [c setTexture:fr->exposure ?: e->dummy atIndex:3];
+        [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->motion offset:0 atIndex:3], [c setBuffer:e->kBuf offset:0 atIndex:4];
+        grid(isDepthFormat(fr->depth.pixelFormat) ? e->gprepD : e->gprep, Wr, Hr);
+
+        // Offset LUT for this frame's jitter and the depth scatter are independent chains: on Metal 4 each LUT pass
+        // shares a barrier slot with a depth pass (overlapNext), instead of each waiting for the other.
+        if (buildLut) {
+            // slot 1 (alongside game prep, which neither reads): clear both
+            c->overlapNext = YES;
+            [c setBytes:&la length:sizeof(la) atIndex:0];
+            [c setBuffer:e->lutMap offset:0 atIndex:1];
+            [c setComputePipelineState:e->lutClear];
+            [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            c->overlapNext = YES;
+        }
+        [c setBytes:&sa length:sizeof(sa) atIndex:0];
+        [c setBuffer:e->depthTm1 offset:0 atIndex:1];
+        grid(e->dclear, Wd, Hd);
+        if (buildLut) {   // slot 2: scatter both
+            [c setBytes:&la length:sizeof(la) atIndex:0];
+            [c setBuffer:e->lutMap offset:0 atIndex:1];
+            grid(e->lutScatter, la.lo[1], la.lo[0]);
+            c->overlapNext = YES;
+        }
+        [c setBytes:&sa length:sizeof(sa) atIndex:0];
+        [c setBuffer:e->motion offset:0 atIndex:1], [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->depthTm1 offset:0 atIndex:3];
+        grid(e->half_ ? e->dscatterQ : e->dscatter, Wd, Hd);
+        if (buildLut) {   // slot 3: LUT selection (+ low-res disocclusion for mid/low)
+            [c setBytes:&la length:sizeof(la) atIndex:0];
+            [c setBuffer:e->lutMap offset:0 atIndex:1];
+            [c setBytes:e->lutWgt length:sizeof(e->lutWgt) atIndex:2];
+            [c setBuffer:lutB offset:lutOff atIndex:3];
+            [c setComputePipelineState:e->lutSelect];
+            [c dispatchThreads:MTLSizeMake(la.hi[0] * la.hi[1], 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+        if (e->half_) {
+            if (buildLut) c->overlapNext = YES;
+            struct { float d2v[4]; float renderSize[2]; int in[2], out[2]; } da =
+                {{e->d2v[0], e->d2v[1], e->d2v[2], e->d2v[3]}, {(float)Hr, (float)Wr}, {Hr, Wr}, {Hd, Wd}};
+            [c setBytes:&da length:sizeof(da) atIndex:0];
+            [c setBuffer:e->motion offset:0 atIndex:1], [c setBuffer:e->depth offset:0 atIndex:2], [c setBuffer:e->depthTm1 offset:0 atIndex:3];
+            [c setBuffer:e->disLqB offset:0 atIndex:4];
+            grid(e->disLq, Wd, Hd);
+        }
     }
 
     // pre-process
-    [c setTexture:fr->color atIndex:0], [c setTexture:e->history[p] atIndex:1];
+    [c setTexture:fr->color atIndex:0], [c setTexture:e->history[p] atIndex:1], [c setTexture:e->tempView[p] atIndex:2];
+    [c setTexture:e->derivTex[p] atIndex:3], [c setTexture:e->derivTex[1 - p] atIndex:4];
     [c setBuffer:e->kBuf offset:0 atIndex:12];
     const float ctInv[2] = {1.0f / fr->color.height, 1.0f / fr->color.width};   // (row, col)
     if (e->half_) {
@@ -677,8 +786,9 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
             {{e->d2v[0], e->d2v[1], e->d2v[2], e->d2v[3]}, {fr->jy, fr->jx}, {(float)Hr, (float)Wr}, {Hr, Wr}, {Hp, Wp}, {Hq, Wq},
              {Hd, Wd}, 1.0f, e->IN.wpad, e->TEMP[0].wpad, 0, {ctInv[0], ctInv[1]}};
         [c setBytes:&ha length:sizeof(ha) atIndex:0];
-        id<MTLBuffer> hb[11] = {nil, e->depth, e->motion, nil, e->disLqB, e->deriv[p], e->TEMP[p].b, e->IN.b, e->deriv[1 - p], e->dis, e->nearest};
+        id<MTLBuffer> hb[11] = {nil, e->depth, e->motion, nil, e->disLqB, nil, nil, e->IN.b, nil, e->dis, e->nearest};
         for (int i = 0; i < 11; i++) if (hb[i]) [c setBuffer:hb[i] offset:0 atIndex:i + 1];
+        [c setBuffer:e->dilMotion offset:0 atIndex:13];
         gridTG(e->preHalf, Wp, Hp, "LSFG_NSS_TG_PRE");
     } else {
         struct { float d2v[4]; float jitter[2], renderSize[2]; int inDims[2], padDims[2], depthDims[2], outDims[2];
@@ -686,7 +796,7 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
             {{e->d2v[0], e->d2v[1], e->d2v[2], e->d2v[3]}, {fr->jy, fr->jx}, {(float)Hr, (float)Wr}, {Hr, Wr}, {Hp, Wp}, {Hd, Wd},
              {Ho, Wo}, 1.0f, e->IN.wpad, e->TEMP[0].wpad, 0, {ctInv[0], ctInv[1]}};
         [c setBytes:&ra length:sizeof(ra) atIndex:0];
-        id<MTLBuffer> pb[11] = {nil, e->depth, e->motion, nil, e->depthTm1, e->deriv[p], e->TEMP[p].b, e->IN.b, e->deriv[1 - p], e->dis, e->nearest};
+        id<MTLBuffer> pb[11] = {nil, e->depth, e->motion, nil, e->depthTm1, nil, nil, e->IN.b, nil, e->dis, e->nearest};
         for (int i = 0; i < 11; i++) if (pb[i]) [c setBuffer:pb[i] offset:0 atIndex:i + 1];
         grid(e->pre, Wp, Hp);
     }
@@ -714,8 +824,9 @@ static void nssEncode(NssEngine *e, id cbObj, BOOL metal4, id<MTLFence> fence, c
             e->KPN.wpad, e->KPN.C, e->TEMP[0].wpad, 0, {Hq, Wq}, {e->half_ ? Hp : Hr, e->half_ ? Wp : Wr},
             e->half_, e->half_, e->quality >= 1, 1, getenv("LSFG_NSS_POST_ABLATE") ? atoi(getenv("LSFG_NSS_POST_ABLATE")) : 0};
     [c setBytes:&qa length:sizeof(qa) atIndex:0];
-    [c setBuffer:e->KPN.b offset:0 atIndex:3], [c setBuffer:e->TEMP[1 - p].b offset:0 atIndex:4];
+    [c setBuffer:e->KPN.b offset:0 atIndex:3], [c setTexture:e->tempView[1 - p] atIndex:4];
     [c setBuffer:e->motion offset:0 atIndex:5], [c setBuffer:e->nearest offset:0 atIndex:6], [c setBuffer:lutB offset:lutOff atIndex:7];
+    [c setBuffer:e->dilMotion offset:0 atIndex:8];
     [c setTexture:e->history[1 - p] atIndex:0], [c setTexture:fr->color atIndex:1], [c setTexture:e->history[p] atIndex:2];
     [c setTexture:fr->output atIndex:3], [c setBuffer:e->kBuf offset:0 atIndex:9];
     gridTG(e->post, Wo, Ho, "LSFG_NSS_TG_POST");   // also writes the game's output
