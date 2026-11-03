@@ -1,7 +1,9 @@
-# Experiment: making NSS cheaper in the hook
+# Making NSS cheaper: experiment log
 
-Branch: `experiment/helixsr-vs-metalfx`. Started 2026-11-02. Follows [helixsr-vs-metalfx.md](helixsr-vs-metalfx.md),
-which ported Arm Neural Super Sampling (NSS) v1 to Metal and put it in place of MetalFX in TLOU2.
+Started 2026-11-02, after the port described in [quality.md](quality.md), which also put NSS in place of MetalFX in
+TLOU2. These notes were written while NSSMetal still lived inside a game hook: paths like `hook/test/nss_perf.sh` are
+from there (`Sources/nss-bench` is this repo's equivalent), and the debug switches were called `LSFG_NSS_*`; they
+are `NSS_*` now (the old names still work).
 
 Goal: cut NSS mid's per-frame cost, which in TLOU2 (GPTK 4, DLSS Balanced, 1488×928 → 2560×1600) was 2.23 ms of GPU
 time per upscale against MetalFX's 1.34 ms.

@@ -1,0 +1,11 @@
+NSSMetal
+Copyright 2026 Maxim Kotliar
+
+This project ports parts of Arm's Neural Super Sampling reference implementation
+(https://github.com/arm/neural-graphics-model-gym, usecases/nss): the pass schedule, the offset
+look-up table, and the pre- and post-processing. That code is licensed under the Apache License 2.0,
+Copyright Arm Limited and/or its affiliates.
+
+The NSS network weights are not part of this project. They are published by Arm at
+https://huggingface.co/Arm/neural-super-sampling under the Arm AI Model Community License, which
+governs their use and redistribution, including its acceptable-use terms.
