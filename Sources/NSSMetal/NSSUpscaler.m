@@ -44,7 +44,7 @@ static int nss_gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } re
 @interface NssEngine : NSObject {
 @public
     int Hr, Wr, Ho, Wo, Hp, Wp, Hq, Wq, Hd, Wd, quality, kpnCh, taps, idxModH, idxModW, p, frame;
-    int procF;   // input pixels per process pixel per axis: 1 high, 2 mid/low, 4 (NSS_PROC=4) quarter
+    int procF;   // input pixels per process pixel per axis: 1 high, 2 mid/low, 4 fast
     BOOL half_;
     float d2v[4];
     id<MTLDevice> dev;
@@ -172,15 +172,15 @@ static NssT nssTensor(NssEngine *e, int H, int W, int C) {
 
 static void nssTune(NssEngine *e, id<MTLCommandQueue> q);
 
-// quality: 0 low, 1 mid, 2 high. Returns nil (and logs) when something is missing.
+// quality: 0 low, 1 mid, 2 high, 3 fast (mid at a quarter-resolution network). Returns nil (and logs) when something is missing.
 static NssEngine *nssCreate(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> lib, NSString *weightsDir,
                             int wr, int hr, int wo, int ho, int quality, float zNear, float zFar, float fovY) {
     NssEngine *e = [NssEngine new];
     e->dev = dev, e->Wr = wr, e->Hr = hr, e->Wo = wo, e->Ho = ho, e->quality = quality;
-    e->half_ = quality < 2;
+    e->half_ = quality != 2;
     e->kpnCh = e->half_ ? 16 : 36, e->taps = e->half_ ? 4 : 9;
-    // experiment (lossy): NSS_PROC=4 runs mid/low's network at a quarter of the input resolution instead of half
-    e->procF = e->half_ && nssEnv("PROC") && atoi(nssEnv("PROC")) == 4 ? 4 : e->half_ ? 2 : 1;
+    // fast: the network at a quarter of the input resolution instead of half (NSS_PROC=4 does it for mid/low too)
+    e->procF = quality == 3 || (e->half_ && nssEnv("PROC") && atoi(nssEnv("PROC")) == 4) ? 4 : e->half_ ? 2 : 1;
     e->Hq = hr / e->procF, e->Wq = wr / e->procF;
     e->Hp = (e->Hq + 7) / 8 * 8, e->Wp = (e->Wq + 7) / 8 * 8;
     e->Hd = e->half_ ? hr / 4 : hr / 2, e->Wd = e->half_ ? wr / 4 : wr / 2;

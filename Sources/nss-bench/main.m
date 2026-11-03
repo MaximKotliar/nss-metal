@@ -1,7 +1,7 @@
 // nss-bench: renders a moving, jittered test scene, upscales it with NSSMetal (or MetalFX, for comparison) and reports
 // the upscale's GPU time; writes the last output frame as a PNG.
 //
-//   swift run -c release nss-bench [--resources DIR] [--quality low|mid|high] [--size 1488x928:2560x1600]
+//   swift run -c release nss-bench [--resources DIR] [--quality fast|low|mid|high] [--size 1488x928:2560x1600]
 //                                  [--frames N] [--metalfx] [--game-like] [--png OUT.png]
 //
 // --resources: folder with nss_midlow.bin / nss_high.bin and, optionally, nss.metallib (scripts/build-metallib.sh).
@@ -80,14 +80,14 @@ int main(int argc, char **argv) {
             else if ([a isEqual:@"--size"]) { if (sscanf(next().UTF8String, "%dx%d:%dx%d", &Wr, &Hr, &Wo, &Ho) != 4) fail(@"--size WxH:WxH"); }
             else if ([a isEqual:@"--quality"]) {
                 NSString *q = next();
-                quality = [q isEqual:@"low"] ? NSSQualityLow : [q isEqual:@"high"] ? NSSQualityHigh : NSSQualityMid;
+                quality = [q isEqual:@"low"] ? NSSQualityLow : [q isEqual:@"high"] ? NSSQualityHigh : [q isEqual:@"fast"] ? NSSQualityFast : NSSQualityMid;
             }
             else if ([a isEqual:@"--metalfx"]) useMetalFX = YES;
             else if ([a isEqual:@"--game-like"]) gameLike = YES;
             else fail([@"unknown option " stringByAppendingString:a]);
 #undef next
         }
-        if (getenv("NSS_HELP")) fail(@"usage: nss-bench [--resources DIR] [--quality low|mid|high] [--size WxH:WxH] [--frames N] [--metalfx] [--game-like] [--png OUT.png]");
+        if (getenv("NSS_HELP")) fail(@"usage: nss-bench [--resources DIR] [--quality fast|low|mid|high] [--size WxH:WxH] [--frames N] [--metalfx] [--game-like] [--png OUT.png]");
 
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
         }
         [ms sortUsingSelector:@selector(compare:)];
         printf("%s %dx%d -> %dx%d%s: setup %.0f ms, upscale GPU median %.3f ms, p95 %.3f ms (%lu frames)\n",
-               fx ? "MetalFX" : quality == NSSQualityLow ? "NSS low" : quality == NSSQualityHigh ? "NSS high" : "NSS mid",
+               fx ? "MetalFX" : quality == NSSQualityLow ? "NSS low" : quality == NSSQualityHigh ? "NSS high" : quality == NSSQualityFast ? "NSS fast" : "NSS mid",
                Wr, Hr, Wo, Ho, gameLike ? ", game-like" : "", setupMs, ms.count ? ms[ms.count / 2].doubleValue : 0,
                ms.count ? ms[ms.count * 95 / 100].doubleValue : 0, (unsigned long)ms.count);
 

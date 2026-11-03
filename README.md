@@ -9,6 +9,7 @@ MetalFX's temporal upscaler it keeps more fine detail and flickers less, at abou
 
 | Quality | What changes | GPU time, 1488×928 → 2560×1600, M4 Max |
 |---|---|---|
+| fast | quarter-resolution network (mid's weights), Catmull-Rom history; fine static patterns a little softer | ~0.8 ms |
 | low | half-resolution network, bilinear history | ~1.25 ms |
 | mid | half-resolution network, Catmull-Rom history | ~1.3 ms |
 | high | full-resolution network, 9-tap filter | ~3.5 ms |
@@ -100,7 +101,7 @@ swift run -c release nss-bench --metalfx --game-like          # MetalFX on the s
 ```
 
 `nss-bench` renders a moving, jittered test scene, upscales it, prints the median and p95 GPU time of the upscale and
-writes the last frame. `--quality low|mid|high`, `--size 1712x1072:2560x1600`, `--frames N`.
+writes the last frame. `--quality fast|low|mid|high`, `--size 1712x1072:2560x1600`, `--frames N`.
 
 ## Debug switches
 

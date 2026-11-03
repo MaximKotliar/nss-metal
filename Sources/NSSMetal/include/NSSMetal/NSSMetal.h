@@ -22,12 +22,15 @@
 NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, NSSQuality) {
-    /// Half-resolution network, bilinear history. Cheapest.
+    /// Half-resolution network, bilinear history. Saves little over mid; prefer fast.
     NSSQualityLow = 0,
     /// Half-resolution network, Catmull-Rom history. About the GPU cost of MetalFX; the usual choice.
     NSSQualityMid = 1,
     /// Full-resolution network, 9-tap filter. About 3x the cost of mid.
     NSSQualityHigh = 2,
+    /// Quarter-resolution network (mid's weights), Catmull-Rom history. Cheapest: about 0.6x mid's GPU time; detail
+    /// close to mid, fine static patterns a little softer.
+    NSSQualityFast = 3,
 };
 
 @interface NSSUpscalerDescriptor : NSObject <NSCopying>
