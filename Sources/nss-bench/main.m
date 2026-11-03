@@ -1,11 +1,11 @@
 // nss-bench: renders a moving, jittered test scene, upscales it with NSSMetal (or MetalFX, for comparison) and reports
 // the upscale's GPU time; writes the last output frame as a PNG.
 //
-//   swift run -c release nss-bench --resources DIR [--quality low|mid|high] [--size 1488x928:2560x1600]
+//   swift run -c release nss-bench [--resources DIR] [--quality low|mid|high] [--size 1488x928:2560x1600]
 //                                  [--frames N] [--metalfx] [--game-like] [--png OUT.png]
 //
-// --resources: folder with nss_midlow.bin / nss_high.bin (tools/export_weights.py) and, optionally, nss.metallib
-// (scripts/build-metallib.sh; without it the bundled kernel source is compiled at startup).
+// --resources: folder with nss_midlow.bin / nss_high.bin and, optionally, nss.metallib (scripts/build-metallib.sh).
+// Default: the weights bundled with the package and its kernel source, compiled at startup.
 // --game-like: the formats a D3DMetal game hands MetalFX (RG11B10 color and output, Depth32Float_Stencil8 depth,
 // motion in UV units, a 1x1 exposure texture).
 #import <Foundation/Foundation.h>
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
             else fail([@"unknown option " stringByAppendingString:a]);
 #undef next
         }
-        if (!useMetalFX && !resources) fail(@"usage: nss-bench --resources DIR [--quality low|mid|high] [--size WxH:WxH] [--frames N] [--metalfx] [--game-like] [--png OUT.png]");
+        if (getenv("NSS_HELP")) fail(@"usage: nss-bench [--resources DIR] [--quality low|mid|high] [--size WxH:WxH] [--frames N] [--metalfx] [--game-like] [--png OUT.png]");
 
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
             [NSSUpscaler setLogHandler:^(NSString *m) { if (getenv("NSS_VERBOSE")) fprintf(stderr, "%s\n", m.UTF8String); }];
             NSSUpscalerDescriptor *d = [NSSUpscalerDescriptor new];
             d.inputWidth = Wr, d.inputHeight = Hr, d.outputWidth = Wo, d.outputHeight = Ho, d.quality = quality;
-            d.resourceDirectory = [NSURL fileURLWithPath:resources];
+            if (resources) d.resourceDirectory = [NSURL fileURLWithPath:resources];   // default: the bundled weights
             nss = [[NSSUpscaler alloc] initWithDevice:dev descriptor:d error:&e];
             if (!nss) fail(e.localizedDescription);
         }

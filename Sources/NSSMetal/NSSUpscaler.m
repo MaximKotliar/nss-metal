@@ -2,8 +2,8 @@
 //
 // Ports the NSS pass schedule, offset LUT and pre/post-processing from Arm's Apache-2.0 reference
 // (arm/neural-graphics-model-gym, usecases/nss); the 14-layer network runs as simdgroup-matrix convolutions.
-// The network weights are Arm's (Hugging Face, Arm AI Model Community License) and are not part of this
-// project: tools/export_weights.py turns their release into the files loaded here.
+// The network weights are Arm's (Hugging Face, Arm AI Model Community License, not Apache-2.0): bundled in
+// Weights/ with their license and acceptable-use terms; tools/export_weights.py reproduces them from Arm's release.
 //
 // Public API: include/NSSMetal/NSSMetal.h; everything else here is internal. Debug switches are environment
 // variables NSS_* (README.md lists them).
@@ -924,14 +924,24 @@ static id<MTLLibrary> nssLoadLibrary(id<MTLDevice> dev, NSSUpscalerDescriptor *d
         if (error) *error = nssError(@"the output must be larger than the input, and the input at least 8x8");
         return nil;
     }
-    if (!d.resourceDirectory) {
-        if (error) *error = nssError(@"resourceDirectory (with the weights) is not set");
+    NSString *weightsDir = d.resourceDirectory.path;
+#ifdef SWIFTPM_MODULE_BUNDLE
+    if (!weightsDir) {   // the weights bundled with the package (Arm AI Model Community License: Weights/README.md)
+        @try {
+            weightsDir = [SWIFTPM_MODULE_BUNDLE.resourcePath stringByAppendingPathComponent:@"Weights"];
+        } @catch (NSException *x) {
+            nss_log(@"nss: no bundled weights: %@", x.reason);
+        }
+    }
+#endif
+    if (!weightsDir) {
+        if (error) *error = nssError(@"no weights: set resourceDirectory (the package's Sources/NSSMetal/Weights holds them)");
         return nil;
     }
     id<MTLLibrary> lib = nssLoadLibrary(device, d, error);
     if (!lib) return nil;
     _queue = [device newCommandQueue];
-    _engine = nssCreate(device, _queue, lib, d.resourceDirectory.path, wr, hr, wo, ho, (int)d.quality, d.zNear, d.zFar,
+    _engine = nssCreate(device, _queue, lib, weightsDir, wr, hr, wo, ho, (int)d.quality, d.zNear, d.zFar,
                         d.verticalFieldOfView);
     if (!_engine) {
         if (error) *error = nssError(@"setup failed (missing weights or kernels; set a log handler for details)");

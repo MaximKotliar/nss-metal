@@ -18,18 +18,24 @@ output size with input-content properties (what D3DMetal games do, to allow dyna
 [docs/optimization.md](docs/optimization.md) for how the time was brought down from 6.4 / 2.3 ms, experiment by
 experiment, and [docs/quality.md](docs/quality.md) for image quality against MetalFX and how the port was checked.
 
-## Get the weights
+## Weights
 
-The weights are Arm's, under the [Arm AI Model Community License](https://huggingface.co/Arm/neural-super-sampling),
-and are not in this repository. Download the release and convert it (needs Python with PyTorch):
+Arm's trained weights come with the package, in [`Sources/NSSMetal/Weights`](Sources/NSSMetal/Weights) (about 1.2 MB),
+converted to the format NSSMetal loads. **They are not under this repository's Apache-2.0 license:** they're Arm's,
+under the [Arm AI Model Community License](Sources/NSSMetal/Weights/Arm_AI_Model_Community_License_v1_0_PRE-1154.pdf).
+It allows commercial use and redistribution, provided that whoever distributes them:
+
+- ships the license and Arm's notices with them,
+- marks changes (the conversion is described in the folder's README),
+- binds their users to the license's acceptable-use clause, and tells them their product is covered by it
+  ([ACCEPTABLE_USE.md](Sources/NSSMetal/Weights/ACCEPTABLE_USE.md)).
+
+To convert Arm's release yourself (needs Python with PyTorch):
 
 ```bash
 git clone https://huggingface.co/Arm/neural-super-sampling
-python3 tools/export_weights.py neural-super-sampling nss
+python3 tools/export_weights.py neural-super-sampling nss     # then set resourceDirectory to nss/
 ```
-
-This writes `nss/nss_midlow.bin` (low and mid) and `nss/nss_high.bin`. If you ship them, ship the license and its
-notices with them.
 
 ## Use it
 
@@ -41,7 +47,8 @@ Swift Package Manager:
 ```
 
 Without SwiftPM, compile `Sources/NSSMetal/NSSUpscaler.m` (ARC) with `Sources/NSSMetal/include` on the header path,
-link Metal and QuartzCore, and build the kernels with `scripts/build-metallib.sh nss/nss.metallib`.
+link Metal and QuartzCore, build the kernels with `scripts/build-metallib.sh nss/nss.metallib`, copy the two `.bin`
+files from `Sources/NSSMetal/Weights` next to it, and set `resourceDirectory` to that folder.
 
 ```objc
 #import <NSSMetal/NSSMetal.h>
@@ -49,7 +56,7 @@ link Metal and QuartzCore, and build the kernels with `scripts/build-metallib.sh
 NSSUpscalerDescriptor *d = [NSSUpscalerDescriptor new];
 d.inputWidth = 1488, d.inputHeight = 928, d.outputWidth = 2560, d.outputHeight = 1600;
 d.quality = NSSQualityMid;
-d.resourceDirectory = [NSURL fileURLWithPath:@"/path/to/nss"];   // weights (+ nss.metallib, optional)
+// weights: bundled (Swift package); or d.resourceDirectory = a folder with them (+ nss.metallib, optional)
 NSError *error;
 NSSUpscaler *upscaler = [[NSSUpscaler alloc] initWithDevice:device descriptor:d error:&error];
 
@@ -79,8 +86,7 @@ Notes:
 ## Try it
 
 ```bash
-scripts/build-metallib.sh nss/nss.metallib
-swift run -c release nss-bench --resources nss --game-like --png out.png
+swift run -c release nss-bench --game-like --png out.png     # bundled weights, kernels compiled at startup
 swift run -c release nss-bench --metalfx --game-like          # MetalFX on the same scene
 ```
 
@@ -103,6 +109,9 @@ Set a log handler with `+[NSSUpscaler setLogHandler:]` to see them.
 
 ## License
 
-Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). The pass schedule, offset table and pre/post-processing
-are ported from Arm's Apache-2.0 [neural-graphics-model-gym](https://github.com/arm/neural-graphics-model-gym).
-The weights are separate and under Arm's own license.
+The code is Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). The pass schedule, offset table and
+pre/post-processing are ported from Arm's Apache-2.0
+[neural-graphics-model-gym](https://github.com/arm/neural-graphics-model-gym).
+
+The weights in `Sources/NSSMetal/Weights` are Arm's, under the Arm AI Model Community License, with its acceptable-use
+terms: see that folder.

@@ -2,3 +2,6 @@
 .swiftpm/
 *.metallib
 *.bin
+
+# the NSS weights are part of the package (Arm license, see Sources/NSSMetal/Weights)
+!Sources/NSSMetal/Weights/*.bin

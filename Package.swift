@@ -12,7 +12,10 @@ let package = Package(
         .target(
             name: "NSSMetal",
             path: "Sources/NSSMetal",
-            resources: [.copy("Shaders")],   // nss.metal: compiled at setup when no nss.metallib is given
+            resources: [
+                .copy("Shaders"),   // nss.metal: compiled at setup when no nss.metallib is given
+                .copy("Weights"),   // Arm's NSS weights, Arm AI Model Community License (see Weights/README.md)
+            ],
             publicHeadersPath: "include",
             linkerSettings: [.linkedFramework("Metal"), .linkedFramework("QuartzCore")]
         ),

@@ -6,7 +6,7 @@
 //
 //   NSSUpscalerDescriptor *d = [NSSUpscalerDescriptor new];
 //   d.inputWidth = 1488, d.inputHeight = 928, d.outputWidth = 2560, d.outputHeight = 1600;
-//   d.resourceDirectory = [NSURL fileURLWithPath:@"…/nss"];   // nss.metallib, nss_midlow.bin, nss_high.bin
+//   // weights: bundled with the Swift package; or set d.resourceDirectory to a folder with them
 //   NSSUpscaler *up = [[NSSUpscaler alloc] initWithDevice:device descriptor:d error:&error];
 //   …each frame:
 //   up.colorTexture = color; up.depthTexture = depth; up.motionTexture = motion; up.outputTexture = output;
@@ -35,8 +35,9 @@ typedef NS_ENUM(NSInteger, NSSQuality) {
 @property (nonatomic) NSUInteger inputWidth, inputHeight;
 @property (nonatomic) NSUInteger outputWidth, outputHeight;
 @property (nonatomic) NSSQuality quality;   // default NSSQualityMid
-/// Folder with nss_midlow.bin (low, mid) or nss_high.bin (high), made by tools/export_weights.py, and
-/// nss.metallib (scripts/build-metallib.sh) unless `library` is set.
+/// Folder with nss_midlow.bin (low, mid) or nss_high.bin (high), and optionally nss.metallib
+/// (scripts/build-metallib.sh). Default (nil): the weights bundled with the Swift package, Sources/NSSMetal/Weights,
+/// which are Arm's, under the Arm AI Model Community License and its acceptable-use terms (see that folder).
 @property (nonatomic, copy, nullable) NSURL *resourceDirectory;
 /// The NSS kernels, if you build them into your own library. Default: resourceDirectory/nss.metallib.
 @property (nonatomic, strong, nullable) id<MTLLibrary> library;
